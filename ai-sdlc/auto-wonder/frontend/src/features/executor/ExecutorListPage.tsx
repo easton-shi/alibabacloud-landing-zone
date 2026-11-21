@@ -42,15 +42,27 @@ import { readViewPreference, writeViewPreference } from '@/shared/lib/viewPrefer
 import { detectStartupOs } from './startupOs';
 import { parseExecutorAgentParam } from './executorAgentParam';
 
-const CLIENT_KINDS: { value: string; label: string; color: string; Icon: typeof CodeOutlined | typeof RobotHeadIcon }[] = [
-  { value: 'QODER_CN_CLI', label: 'Qoder CLI CN', color: 'var(--aw-accent-text)', Icon: CodeOutlined },
-  { value: 'QODER_CLI', label: 'Qoder CLI', color: 'var(--aw-accent-text)', Icon: CodeOutlined },
-  { value: 'CLAUDE_CODE', label: 'Claude Code', color: '#d4380d', Icon: RobotHeadIcon },
-  { value: 'CODEX_CLI', label: 'Codex CLI', color: '#13a8a8', Icon: CodeSandboxOutlined },
-  { value: 'CURSOR_CLI', label: 'Cursor CLI', color: 'var(--aw-text)', Icon: CodeSandboxOutlined },
+type ClientKindLabelKey = 'clientKindQoderCn' | 'clientKindQoder' | 'clientKindClaude' | 'clientKindCodex'
+  | 'clientKindOpencode' | 'clientKindPi' | 'clientKindCursor';
+interface ClientKindDefinition {
+  value: string;
+  labelKey: ClientKindLabelKey;
+  color: string;
+  Icon: typeof CodeOutlined | typeof RobotHeadIcon;
+}
+const CLIENT_KINDS: ClientKindDefinition[] = [
+  { value: 'QODER_CN_CLI', labelKey: 'clientKindQoderCn', color: 'var(--aw-accent-text)', Icon: CodeOutlined },
+  { value: 'QODER_CLI', labelKey: 'clientKindQoder', color: 'var(--aw-accent-text)', Icon: CodeOutlined },
+  { value: 'CLAUDE_CODE', labelKey: 'clientKindClaude', color: '#d4380d', Icon: RobotHeadIcon },
+  { value: 'CODEX_CLI', labelKey: 'clientKindCodex', color: '#13a8a8', Icon: CodeSandboxOutlined },
+  { value: 'OPENCODE_CLI', labelKey: 'clientKindOpencode', color: '#531dab', Icon: CodeSandboxOutlined },
+  { value: 'PI_CLI', labelKey: 'clientKindPi', color: '#d48806', Icon: RobotHeadIcon },
+  { value: 'CURSOR_CLI', labelKey: 'clientKindCursor', color: 'var(--aw-text)', Icon: CodeSandboxOutlined },
 ];
 
-const clientKindMap = Object.fromEntries(CLIENT_KINDS.map((k) => [k.value, k]));
+const clientKindMap: Record<string, ClientKindDefinition> = Object.fromEntries(
+  CLIENT_KINDS.map((kind) => [kind.value, kind]),
+);
 
 export function isQoderClientKind(kind?: string | null): boolean {
   return kind === 'QODER_CLI' || kind === 'QODER_CN_CLI';
@@ -61,8 +73,8 @@ export function isClientKindMissing(kind?: string | null): boolean {
   return !kind || !kind.trim();
 }
 
-// 新建执行器仅开放 Qoder 系执行器，其余类型在列表中仍正常展示
-export const CREATABLE_CLIENT_KINDS = CLIENT_KINDS.filter((k) => isQoderClientKind(k.value));
+// Cursor 仍保留在历史执行器列表中，但自研 Runtime 没有 Cursor provider，创建入口不提供。
+export const CREATABLE_CLIENT_KINDS = CLIENT_KINDS.filter((k) => k.value !== 'CURSOR_CLI');
 
 const EXECUTORS_VIEW_STORAGE_KEY = 'autowonder.executors.view';
 const EXECUTORS_VIEW_OPTIONS = ['agent', 'squad'] as const;
@@ -240,7 +252,7 @@ function ClientKindSelect({ value, onChange }: { value?: string; onChange?: (v: 
   const { t } = useTranslation('executor');
   return (
     <div role="group" aria-label={t('clientChoice')} style={{ display: 'flex', flexWrap: 'wrap', gap: 12 }}>
-      {CREATABLE_CLIENT_KINDS.map(({ value: v, label, color, Icon }) => {
+      {CREATABLE_CLIENT_KINDS.map(({ value: v, labelKey, color, Icon }) => {
         const selected = value === v;
         return (
           <button
@@ -264,7 +276,7 @@ function ClientKindSelect({ value, onChange }: { value?: string; onChange?: (v: 
             }}
           >
             <span style={{ fontSize: 24, color }}><Icon aria-hidden="true" /></span>
-            <span style={{ fontWeight: 500 }}>{label}</span>
+            <span style={{ fontWeight: 500 }}>{t(labelKey)}</span>
             {selected && (
               <CheckCircleFilled aria-hidden="true"
                 style={{ position: 'absolute', top: 8, right: 8, color: 'var(--aw-accent-text)', fontSize: 16 }}
@@ -387,8 +399,11 @@ export function ExecutorListPage() {
   // 历史缺类型执行器的模型参数由补选的表单类型驱动；正常执行器仍用列表记录里的类型
   const startupKindMissing = isClientKindMissing(startupTarget?.clientKind);
   const startupFormClientKind = Form.useWatch('clientKind', startupForm);
+  const startupEffectiveKind = startupKindMissing ? startupFormClientKind : startupTarget?.clientKind;
+  const startupIsQoder = isQoderClientKind(startupEffectiveKind);
+  const startupUsesFreeModel = Boolean(startupEffectiveKind) && !startupIsQoder;
   const startupQoderProvider = qoderProviderForClientKind(
-    startupKindMissing ? startupFormClientKind : startupTarget?.clientKind,
+    startupEffectiveKind,
   );
   const createQoderProvider = createModalOpen ? qoderProviderForClientKind(clientKind) : undefined;
 
@@ -438,6 +453,13 @@ export function ExecutorListPage() {
     if (!model || model === startupForm.getFieldValue('model')) return;
     startupForm.setFieldsValue(resolveQoderLaunchOptions(model, startupForm.getFieldsValue()));
   }, [startupKindMissing, startupQoderModelOptions, startupQoderProvider, startupForm, startupTarget]);
+
+  // 非 Qoder provider 不接受 Qoder 目录中的模型 ID。切换类型时清掉旧模型，避免把 qmodel_* 误发给其他 Agent。
+  useEffect(() => {
+    if (!createModalOpen || !clientKind || isQoderClientKind(clientKind)) return;
+    if (form.getFieldValue('model') === undefined) return;
+    form.setFieldsValue({ model: undefined, reasoningEffort: undefined, contextWindow: undefined });
+  }, [clientKind, createModalOpen, form]);
 
   const agentsQuery = useQuery({
     queryKey: ['agents', 1, 100],
@@ -613,8 +635,10 @@ export function ExecutorListPage() {
   const startupDraftValues = startupFormValues && startupConfig && !startupKindMissing ? {
     memoryMode: startupFormValues.memoryMode,
     maxConcurrentDispatches: startupFormValues.maxConcurrentDispatches,
-    ...(startupQoderProvider ? {
+    ...(startupEffectiveKind && startupFormValues.model !== undefined ? {
       model: startupFormValues.model,
+    } : {}),
+    ...(startupQoderProvider ? {
       reasoningEffort: startupFormValues.reasoningEffort,
       contextWindow: startupFormValues.contextWindow,
     } : {}),
@@ -807,7 +831,11 @@ export function ExecutorListPage() {
       });
       setStartupModelInvalid(!config.model);
     } else {
-      startupForm.setFieldsValue({ memoryMode: config.memoryMode ?? 'platform', maxConcurrentDispatches: config.maxConcurrentDispatches ?? 5 });
+      startupForm.setFieldsValue({
+        memoryMode: config.memoryMode ?? 'platform',
+        maxConcurrentDispatches: config.maxConcurrentDispatches ?? 5,
+        model: config.model ?? undefined,
+      });
     }
     return config;
   };
@@ -856,8 +884,8 @@ export function ExecutorListPage() {
         ...(kindMissing ? { clientKind: values.clientKind } : {}),
         memoryMode: values.memoryMode,
         maxConcurrentDispatches: values.maxConcurrentDispatches,
+        ...(values.model !== undefined ? { model: values.model } : {}),
         ...(isQoder ? {
-          model: values.model,
           reasoningEffort: values.reasoningEffort,
           contextWindow: values.contextWindow,
         } : {}),
@@ -1016,7 +1044,7 @@ export function ExecutorListPage() {
     { title: t('clientVersion'), width: 150, render: (_, record) => (
       // 历史数据的 clientKind 可为 null：明确标记「类型缺失」，绝不留空白让操作者误判客户端类型。
       <div><div>{record.clientKind
-        ? (Object.prototype.hasOwnProperty.call(clientKindMap, record.clientKind) ? clientKindMap[record.clientKind].label : record.clientKind)
+        ? (Object.prototype.hasOwnProperty.call(clientKindMap, record.clientKind) ? t(clientKindMap[record.clientKind].labelKey) : record.clientKind)
         : <Tag color="warning">{t('missingClientKind')}</Tag>}</div>
         <Typography.Text type="secondary" style={{ fontSize: 12 }}>{record.version ?? t('versionNotReported')}</Typography.Text>
         <div><Typography.Text type="secondary" style={{ fontSize: 12 }}>{record.modelName ?? record.model ?? t('modelNotReported')}</Typography.Text></div>
@@ -1310,6 +1338,11 @@ export function ExecutorListPage() {
               </Form.Item>
             </>
           )}
+          {Boolean(clientKind) && !isQoderClientKind(clientKind) && (
+            <Form.Item label={t('modelId')} name="model">
+              <Input placeholder={t('modelIdPlaceholder')} autoComplete="off" spellCheck={false} />
+            </Form.Item>
+          )}
           <Form.Item label={t('name')} name="name" rules={[{ required: true, message: t('enterName') }]}>
             <Input placeholder={t('nameExample')} />
           </Form.Item>
@@ -1358,7 +1391,7 @@ export function ExecutorListPage() {
             <Form.Item label={t('clientKind')} name="clientKind"
               rules={[{ required: true, message: t('selectClient') }]}
               extra={t('missingKindExtra')}>
-              <Select options={CREATABLE_CLIENT_KINDS.map(({ value, label }) => ({ value, label }))} />
+              <Select options={CREATABLE_CLIENT_KINDS.map(({ value, labelKey }) => ({ value, label: t(labelKey) }))} />
             </Form.Item>
           )}
           <Form.Item label={t('maxConcurrent')} name="maxConcurrentDispatches"
@@ -1387,6 +1420,11 @@ export function ExecutorListPage() {
                 <Select options={startupQoderOptions.contextWindows} />
               </Form.Item>
             </>
+          )}
+          {startupUsesFreeModel && (
+            <Form.Item label={t('modelId')} name="model">
+              <Input placeholder={t('modelIdPlaceholder')} autoComplete="off" spellCheck={false} />
+            </Form.Item>
           )}
         </Form>
         </div>

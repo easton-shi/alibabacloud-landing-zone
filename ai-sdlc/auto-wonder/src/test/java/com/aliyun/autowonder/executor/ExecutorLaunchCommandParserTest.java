@@ -29,6 +29,26 @@ class ExecutorLaunchCommandParserTest {
         }
     }
 
+    @Test void acceptsTheNativeRuntimeCommandAndKeepsItsOptionalModel() {
+        String nativeCommand = "autowonder-runtime connect --ws-url wss://example.test/ws/executor"
+                + " --token 'raw secret' --executor-id 7 --provider codex --memory-mode platform"
+                + " --max-tasks 5 --model openai/gpt-5.1-codex";
+        var config = ExecutorLaunchCommandParser.parse(nativeCommand, nativeCommand, 3);
+        assertEquals("openai/gpt-5.1-codex", config.getModel());
+        assertEquals("platform", config.getMemoryMode());
+        assertEquals(5, config.getMaxConcurrentDispatches());
+        assertNull(config.getRuntimeVersion());
+    }
+
+    @Test void nativeAndNpmRuntimeCommandsCannotBeSwitchedIntoEachOther() {
+        String nativeCommand = "autowonder-runtime connect --ws-url wss://example.test/ws/executor"
+                + " --token 'raw secret' --executor-id 7 --provider codex --memory-mode platform --max-tasks 5";
+        assertThrows(BizException.class,
+                () -> ExecutorLaunchCommandParser.parse(nativeCommand, COMMAND, 1));
+        assertThrows(BizException.class,
+                () -> ExecutorLaunchCommandParser.parse(COMMAND, nativeCommand, 1));
+    }
+
     @AfterEach void clearLocale() { LocaleContextHolder.resetLocaleContext(); }
 
     @Test void parsesExplicitVersionChangesAndOtherLaunchOptions() {

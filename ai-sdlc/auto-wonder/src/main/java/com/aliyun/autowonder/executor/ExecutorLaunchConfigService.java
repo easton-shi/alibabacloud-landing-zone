@@ -55,8 +55,7 @@ public class ExecutorLaunchConfigService {
         ExecutorDO executor = requireExecutor(id, tenantId);
         LaunchConfig stored = parse(executor.getLaunchConfig());
         int version = versionOf(executor);
-        String provider = ExecutorLaunchOptionsService.resolveProvider(executor.getClientKind());
-        return toVo(stored, version, ExecutorLaunchOptionsService.isQoderFamily(provider));
+        return toVo(stored, version);
     }
 
     /**
@@ -85,8 +84,7 @@ public class ExecutorLaunchConfigService {
         if (rows == 0) {
             throw new BizException(ErrorCode.EXECUTOR_LAUNCH_CONFIG_VERSION_CONFLICT);
         }
-        return toVo(stored, expectedVersion + 1, ExecutorLaunchOptionsService.isQoderFamily(
-                ExecutorLaunchOptionsService.resolveProvider(kindToPersist != null ? kindToPersist : executor.getClientKind())));
+        return toVo(stored, expectedVersion + 1);
     }
 
     public LaunchConfig previewConfig(long id, long tenantId, UpdateExecutorLaunchConfigRequest request) {
@@ -108,6 +106,12 @@ public class ExecutorLaunchConfigService {
         LaunchConfig stored = resolve(tenantId, clientKind,
                 req.getMemoryMode(), req.getModel(),
                 req.getReasoningEffort(), req.getContextWindow(), true);
+        if (!ExecutorLaunchOptionsService.hasModelCatalog(
+                ExecutorLaunchOptionsService.resolveProvider(clientKind))) {
+            if (req.getModel() == null) stored.model = previous.model;
+            if (req.getReasoningEffort() == null) stored.reasoningEffort = previous.reasoningEffort;
+            if (req.getContextWindow() == null) stored.contextWindow = previous.contextWindow;
+        }
         stored.maxConcurrentDispatches = resolveMaxConcurrentDispatches(req.getMaxConcurrentDispatches() != null
                 ? req.getMaxConcurrentDispatches() : previous.maxConcurrentDispatches);
         stored.modelUpgradePolicy = req.getModelUpgradePolicy() == null
@@ -135,8 +139,7 @@ public class ExecutorLaunchConfigService {
                 executor.getClientKind());
         if (executorDao.updateLaunchConfig(id, tenantId, mergePolicy(executor.getLaunchConfig(), stored.modelUpgradePolicy), request.getVersion(), userId) == 0)
             throw new BizException(ErrorCode.EXECUTOR_LAUNCH_CONFIG_VERSION_CONFLICT);
-        return toVo(stored, request.getVersion() + 1, ExecutorLaunchOptionsService.isQoderFamily(
-                ExecutorLaunchOptionsService.resolveProvider(executor.getClientKind())));
+        return toVo(stored, request.getVersion() + 1);
     }
 
     private String mergePolicy(String json, ModelUpgradePolicy policy) {
@@ -215,10 +218,7 @@ public class ExecutorLaunchConfigService {
         if (!isNotBlank(stored.memoryMode)) {
             throw incomplete();
         }
-        if (!ExecutorLaunchOptionsService.isQoderFamily(provider)) {
-            stored.model = null;
-            stored.reasoningEffort = null;
-            stored.contextWindow = null;
+        if (!ExecutorLaunchOptionsService.hasModelCatalog(provider)) {
             return stored;
         }
         if (!isNotBlank(stored.model) || !isNotBlank(stored.reasoningEffort)
@@ -249,7 +249,14 @@ public class ExecutorLaunchConfigService {
         String provider = ExecutorLaunchOptionsService.resolveProvider(clientKind);
         LaunchConfig config = new LaunchConfig();
         config.memoryMode = options.resolveMemoryMode(memoryMode);
-        if (!ExecutorLaunchOptionsService.isQoderFamily(provider)) {
+        if (!ExecutorLaunchOptionsService.hasModelCatalog(provider)) {
+            config.model = optionalModel(model);
+            config.reasoningEffort = isNotBlank(reasoningEffort)
+                    ? options.resolveReasoningEffort(config.model, reasoningEffort)
+                    : ExecutorLaunchOptionsService.DEFAULT_REASONING_EFFORT;
+            config.contextWindow = isNotBlank(contextWindow)
+                    ? options.resolveContextWindow(contextWindow)
+                    : ExecutorLaunchOptionsService.DEFAULT_CONTEXT_WINDOW;
             return config;
         }
         String requested = model == null ? null : model.trim();
@@ -303,11 +310,11 @@ public class ExecutorLaunchConfigService {
         }
     }
 
-    private static ExecutorLaunchConfigVO toVo(LaunchConfig config, int version, boolean qoder) {
+    private static ExecutorLaunchConfigVO toVo(LaunchConfig config, int version) {
         ExecutorLaunchConfigVO vo = new ExecutorLaunchConfigVO();
-        vo.setModel(qoder ? config.model : null);
-        vo.setReasoningEffort(qoder ? config.reasoningEffort : null);
-        vo.setContextWindow(qoder ? config.contextWindow : null);
+        vo.setModel(config.model);
+        vo.setReasoningEffort(config.reasoningEffort);
+        vo.setContextWindow(config.contextWindow);
         vo.setMemoryMode(config.memoryMode);
         vo.setMaxConcurrentDispatches(config.maxConcurrentDispatches);
         vo.setModelUpgradePolicy(config.modelUpgradePolicy);
@@ -359,7 +366,7 @@ public class ExecutorLaunchConfigService {
                     || level.getModel() == null || level.getModel().isBlank()
                     || level.getModel().length() > 200 || !level.getModel().matches("[A-Za-z0-9_.:/+-]+")
                     || !models.add(level.getModel())) throw invalidPolicy();
-            if (policy.isEnabled() && ExecutorLaunchOptionsService.isQoderFamily(provider)
+            if (policy.isEnabled() && ExecutorLaunchOptionsService.hasModelCatalog(provider)
                     && !modelIds(tenantId, provider).contains(level.getModel()))
                 throw new BizException(ErrorCode.EXECUTOR_LAUNCH_CONFIG_MODEL_INVALID);
             previous = level.getEntryCount();
@@ -374,6 +381,17 @@ public class ExecutorLaunchConfigService {
 
     private static boolean isNotBlank(String value) {
         return value != null && !value.isBlank();
+    }
+
+    private static String optionalModel(String value) {
+        if (!isNotBlank(value)) {
+            return null;
+        }
+        String trimmed = value.trim();
+        if (trimmed.length() > 200 || !trimmed.matches("[A-Za-z0-9_.:/+@-]+")) {
+            throw new BizException(ErrorCode.EXECUTOR_LAUNCH_CONFIG_MODEL_INVALID);
+        }
+        return trimmed;
     }
 
     /** Persisted shape of executor.launch_config; public fields mirror the repo's JSON-column POJO style. */

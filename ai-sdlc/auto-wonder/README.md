@@ -38,6 +38,22 @@ Deployment details are in the
 [community runtime guide](docs/community/README.md) and the
 [Alibaba Cloud deployment Skill](skills/deploying-autowonder-on-alibaba-cloud/SKILL.md).
 
+## Fork Add-on: Executor Runtime / Fork 扩展：执行器 Runtime
+
+This fork contains an independent, reverse-engineered executor runtime at
+[`runtime/`](runtime/README.md). It implements the public scheduler/executor
+protocol and supports Codex, OpenCode, Pi, and Claude Code as local agent
+providers for both dispatch execution and interactive conversations. It is
+**not** an Alibaba Cloud official release and is not part of the upstream
+supported community runtime. See the
+[runtime design document](runtime/docs/DESIGN.md) for the protocol, repository
+materialization, skills/MCP, and security boundaries.
+
+本 fork 在 [`runtime/`](runtime/README.md) 中提供了一套独立的逆向实现执行器，
+按官方公开的 scheduler/executor 协议工作，支持 Codex、OpenCode、Pi 和 Claude
+Code 的 dispatch 执行与交互式会话。它不是阿里云官方发布物，也不属于上游受支持的
+Community Runtime。
+
 ## Roadmap / 路线图
 
 ![AutoWonder Community roadmap: September–November 2026 / 2026 年 9—11 月路线图](docs/images/autowonder-community-roadmap.png)

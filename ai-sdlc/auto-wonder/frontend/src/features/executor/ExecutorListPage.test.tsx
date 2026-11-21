@@ -651,8 +651,8 @@ describe('ExecutorListPage', () => {
     expect(screen.getAllByText('选择 Agent').length).toBeGreaterThanOrEqual(1);
     expect(screen.getByText('Qoder CLI')).toBeInTheDocument();
     expect(screen.getByText('Qoder CLI CN')).toBeInTheDocument();
-    expect(screen.queryByText('Claude Code')).not.toBeInTheDocument();
-    expect(screen.queryByText('Codex CLI')).not.toBeInTheDocument();
+    expect(screen.getByText('Claude Code')).toBeInTheDocument();
+    expect(screen.getByText('Codex CLI')).toBeInTheDocument();
     expect(screen.queryByText('Cursor CLI')).not.toBeInTheDocument();
     expect(screen.getByText('记忆模式')).toBeInTheDocument();
     expect(screen.getByText('Qoder 模型')).toBeInTheDocument();
@@ -802,6 +802,40 @@ describe('ExecutorListPage', () => {
     expect(screen.queryByText('请立即复制并保存 Token，关闭后将无法再次查看')).not.toBeInTheDocument();
     expect(screen.queryByLabelText('Token:')).not.toBeInTheDocument();
     expect(commandRequests).toBe(0);
+  });
+
+  it('creates a native agent executor with an optional free-form model id', async () => {
+    const user = userEvent.setup();
+    let createBody: Record<string, unknown> | null = null;
+    server.use(
+      mockSameNameAgents(),
+      ...mockSquadApis(),
+      mockEmptyExecutors(),
+      http.post('/api/agents/40170/executors', async ({ request }) => {
+        createBody = await request.json() as Record<string, unknown>;
+        return HttpResponse.json({
+          success: true, code: '0', message: '', traceId: null,
+          data: { id: 20, agentId: 40170, name: 'runner-codex', clientKind: 'CODEX_CLI',
+            token: 'exec_codex_token', memoryMode: 'platform', model: 'openai/gpt-5.1-codex' },
+        });
+      }),
+    );
+    renderPage();
+
+    await openAgentDropdownInCreateModal(user);
+    await user.click(await screen.findByText('全栈开发（开发+评审双人组）'));
+    const dialog = screen.getByRole('dialog', { name: '新建执行器' });
+    await user.click(within(dialog).getByRole('button', { name: 'Codex CLI' }));
+    await user.type(within(dialog).getByLabelText('模型 ID（可选）'), 'openai/gpt-5.1-codex');
+    await user.type(within(dialog).getByPlaceholderText('如: dev-machine-01'), 'runner-codex');
+    await user.click(dialog.querySelector('.ant-modal-footer button.ant-btn-primary')!);
+
+    await screen.findByText('执行器创建成功');
+    expect(createBody).toMatchObject({
+      name: 'runner-codex', clientKind: 'CODEX_CLI', memoryMode: 'platform', model: 'openai/gpt-5.1-codex',
+    });
+    expect(createBody).not.toHaveProperty('reasoningEffort');
+    expect(createBody).not.toHaveProperty('contextWindow');
   });
 
   it('keeps agent squad suffixes from the agent list when the squad list request fails', async () => {
@@ -1032,11 +1066,13 @@ describe('ExecutorListPage', () => {
     expect(isClientKindMissing('CLAUDE_CODE')).toBe(false);
   });
 
-  it('restricts creatable client kinds to the two Qoder CLIs', () => {
-    expect(CREATABLE_CLIENT_KINDS.map((kind) => kind.value)).toEqual(['QODER_CN_CLI', 'QODER_CLI']);
+  it('offers every runtime-backed client kind and hides Cursor from creation', () => {
+    expect(CREATABLE_CLIENT_KINDS.map((kind) => kind.value)).toEqual([
+      'QODER_CN_CLI', 'QODER_CLI', 'CLAUDE_CODE', 'CODEX_CLI', 'OPENCODE_CLI', 'PI_CLI',
+    ]);
   });
 
-  it('offers only Qoder kinds in the create modal while the list keeps rendering legacy kinds', async () => {
+  it('offers every creatable kind in the create modal while the list keeps rendering legacy kinds', async () => {
     const user = userEvent.setup();
     server.use(
       http.get('/api/agents', () => HttpResponse.json({
@@ -1058,8 +1094,10 @@ describe('ExecutorListPage', () => {
     const createDialog = screen.getByRole('dialog', { name: '新建执行器' });
     expect(within(createDialog).getByText('Qoder CLI')).toBeInTheDocument();
     expect(within(createDialog).getByText('Qoder CLI CN')).toBeInTheDocument();
-    expect(within(createDialog).queryByText('Claude Code')).not.toBeInTheDocument();
-    expect(within(createDialog).queryByText('Codex CLI')).not.toBeInTheDocument();
+    expect(within(createDialog).getByText('Claude Code')).toBeInTheDocument();
+    expect(within(createDialog).getByText('Codex CLI')).toBeInTheDocument();
+    expect(within(createDialog).getByText('OpenCode CLI')).toBeInTheDocument();
+    expect(within(createDialog).getByText('Pi')).toBeInTheDocument();
     expect(within(createDialog).queryByText('Cursor CLI')).not.toBeInTheDocument();
   });
 
@@ -1278,6 +1316,7 @@ describe('ExecutorListPage', () => {
 
     expect(await screen.findByText(/启动命令 · dev-machine-01/)).toBeInTheDocument();
     expect(await screen.findByText(/--provider claude/)).toBeInTheDocument();
+    expect(await screen.findByText(/autowonder-runtime connect/)).toBeInTheDocument();
     expect(screen.queryByText(/--model/)).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: '复制启动命令' })).toBeEnabled();
   });
@@ -1639,6 +1678,8 @@ describe('ExecutorListPage', () => {
 
     expect(await screen.findByText(/启动命令 · dev-machine-01/)).toBeInTheDocument();
     expect(screen.queryByText('Qoder 模型')).not.toBeInTheDocument();
+    // 非 Qoder 仍可填可选的模型 ID，但不能出现 Qoder 的推理档位和上下文窗口
+    expect(within(await findModalByTitle('启动命令 · dev-machine-01')).getByText('模型 ID（可选）')).toBeInTheDocument();
   });
 
   // ---------- 历史缺类型（client_kind NULL/空白）执行器的恢复 ----------
@@ -2227,6 +2268,33 @@ describe('ExecutorListPage', () => {
     await waitFor(() => expect(putBody).toMatchObject({ memoryMode: 'none' }));
     // 非 Qoder 执行器不携带 Qoder 专有字段
     expect(putBody).not.toHaveProperty('model');
+    expect(putBody).not.toHaveProperty('contextWindow');
+  });
+
+  it('persists an optional free-form model id for a non-Qoder executor', async () => {
+    const user = userEvent.setup();
+    serveExecutor({ clientKind: 'CODEX_CLI' });
+    let putBody: Record<string, unknown> | null = null;
+    server.use(http.put('/api/executors/10000/launch-config', async ({ request }) => {
+      putBody = await request.json() as Record<string, unknown>;
+      return HttpResponse.json({
+        success: true, code: '0', message: '', traceId: null,
+        data: { model: 'openai/gpt-5.1-codex', reasoningEffort: null, contextWindow: null,
+          memoryMode: 'platform', version: 2 },
+      });
+    }));
+    renderPage();
+
+    await expandAgentGroup(user, 'A（未编队）');
+    await user.click(await screen.findByRole('button', { name: /启动命令/ }));
+    const dialog = await findModalByTitle('启动命令 · dev-machine-01');
+    await user.type(within(dialog).getByLabelText('模型 ID（可选）'), 'openai/gpt-5.1-codex');
+    await user.click(within(dialog).getByRole('button', { name: '保存配置' }));
+
+    await waitFor(() => expect(putBody).toMatchObject({
+      memoryMode: 'platform', model: 'openai/gpt-5.1-codex', maxConcurrentDispatches: 5,
+    }));
+    expect(putBody).not.toHaveProperty('reasoningEffort');
     expect(putBody).not.toHaveProperty('contextWindow');
   });
 

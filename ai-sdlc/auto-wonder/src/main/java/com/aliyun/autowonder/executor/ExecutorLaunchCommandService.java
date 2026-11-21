@@ -36,6 +36,8 @@ public class ExecutorLaunchCommandService {
     public static final String SHELL_POWERSHELL = "powershell";
 
     private static final String WS_PATH = "/ws/executor";
+    /** The bundled runtime binary/server command used for providers the official npm runtime does not support. */
+    private static final String NATIVE_RUNTIME_COMMAND = "autowonder-runtime";
     private static final Pattern SAFE_SHELL_ARG = Pattern.compile("^[A-Za-z0-9_@%+=:,./-]+$");
     private static final String POWERSHELL_UTF8_PREAMBLE =
             "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
@@ -129,6 +131,12 @@ public class ExecutorLaunchCommandService {
         if (clientKind == null || clientKind.isBlank()) {
             throw new BizException(ErrorCode.EXECUTOR_CLIENT_KIND_MISSING);
         }
+        // 未知类型和暂不支持的 Cursor 不能静默落到 Claude：生成的命令必须真的能被对应 Runtime 执行。
+        if (ExecutorLaunchOptionsService.canonicalClientKind(clientKind) == null
+                || ExecutorLaunchOptionsService.PROVIDER_CURSOR.equals(
+                        ExecutorLaunchOptionsService.resolveProvider(clientKind))) {
+            throw new BizException(ErrorCode.EXECUTOR_CLIENT_KIND_INVALID);
+        }
         ExecutorLaunchConfigService.resolveMaxConcurrentDispatches(maxConcurrentDispatches);
         if (token == null || token.isBlank()) {
             throw BizException.keyed(ErrorCode.MCP_TOOL_ARGUMENT_INVALID, "executor.token_required", null, "token 不能为空");
@@ -141,28 +149,42 @@ public class ExecutorLaunchCommandService {
         if (publicBaseUrl == null || publicBaseUrl.isBlank()) {
             throw BizException.keyed(ErrorCode.SYSTEM_ERROR, "executor.mcp_address_missing", null, "平台 MCP 地址未配置，无法生成执行器启动命令");
         }
-        // 只有明确保存的新固定版本生效；历史残留值继续跟随平台推荐版本。
-        String runtimeVersion = Boolean.TRUE.equals(config.runtimeVersionPinned) && config.runtimeVersion != null
-                ? config.runtimeVersion : brandingService.recommendedRuntimeVersion();
         String wsUrl = buildWsUrl(publicBaseUrl);
         String provider = ExecutorLaunchOptionsService.resolveProvider(clientKind);
         boolean qoderFamily = ExecutorLaunchOptionsService.isQoderFamily(provider);
+        // 只有 Qoder 走官方 npm Runtime；自研 Runtime 没有 npm 版本概念，不能把推荐版本回显成命令。
+        String runtimeVersion = !qoderFamily ? null
+                : Boolean.TRUE.equals(config.runtimeVersionPinned) && config.runtimeVersion != null
+                        ? config.runtimeVersion : brandingService.recommendedRuntimeVersion();
 
-        List<String> argv = new ArrayList<>(List.of(
-                "npx", "-y", RuntimeNpmPackage.spec(runtimeVersion), "connect",
-                "--ws-url", wsUrl,
-                "--token", token,
-                "--executor-id", String.valueOf(executorId),
-                "--provider", provider,
-                "--memory-mode", memoryMode,
-                "--max-tasks", String.valueOf(maxConcurrentDispatches)));
-        if (qoderFamily && model != null) {
-            argv.addAll(List.of("--model", model,
-                    "--reasoning-effort", reasoningEffort,
-                    "--context-window", contextWindow));
-        }
+        List<String> argv = new ArrayList<>();
         if (qoderFamily) {
+            argv.addAll(List.of(
+                    "npx", "-y", RuntimeNpmPackage.spec(runtimeVersion), "connect",
+                    "--ws-url", wsUrl,
+                    "--token", token,
+                    "--executor-id", String.valueOf(executorId),
+                    "--provider", provider,
+                    "--memory-mode", memoryMode,
+                    "--max-tasks", String.valueOf(maxConcurrentDispatches)));
+            if (model != null) {
+                argv.addAll(List.of("--model", model,
+                        "--reasoning-effort", reasoningEffort,
+                        "--context-window", contextWindow));
+            }
             argv.add("--token-aware-enable");
+        } else {
+            argv.addAll(List.of(
+                    NATIVE_RUNTIME_COMMAND, "connect",
+                    "--ws-url", wsUrl,
+                    "--token", token,
+                    "--executor-id", String.valueOf(executorId),
+                    "--provider", provider,
+                    "--memory-mode", memoryMode,
+                    "--max-tasks", String.valueOf(maxConcurrentDispatches)));
+            if (model != null && !model.isBlank()) {
+                argv.addAll(List.of("--model", model));
+            }
         }
         if (config.workspaceRoot != null) argv.addAll(List.of("--workspace-root", config.workspaceRoot));
         if (config.daemonName != null) argv.addAll(List.of("--name", config.daemonName));
@@ -188,7 +210,8 @@ public class ExecutorLaunchCommandService {
         vo.setProvider(provider);
         vo.setMemoryMode(memoryMode);
         vo.setMaxConcurrentDispatches(maxConcurrentDispatches);
-        vo.setModel(qoderFamily ? model : null);
+        vo.setModel(model);
+        // 推理档位和上下文窗口只属于 Qoder 的模型目录；其他 Agent 用自身默认值。
         vo.setReasoningEffort(qoderFamily ? reasoningEffort : null);
         vo.setContextWindow(qoderFamily ? contextWindow : null);
         vo.setWsUrl(wsUrl);

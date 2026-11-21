@@ -29,10 +29,17 @@ public class ExecutorLaunchOptionsService {
 
     public static final String CLIENT_KIND_QODER_CLI = "QODER_CLI";
     public static final String CLIENT_KIND_QODER_CN_CLI = "QODER_CN_CLI";
+    public static final String CLIENT_KIND_CLAUDE_CODE = "CLAUDE_CODE";
+    public static final String CLIENT_KIND_CODEX_CLI = "CODEX_CLI";
+    public static final String CLIENT_KIND_OPENCODE_CLI = "OPENCODE_CLI";
+    public static final String CLIENT_KIND_PI_CLI = "PI_CLI";
+    public static final String CLIENT_KIND_CURSOR_CLI = "CURSOR_CLI";
     public static final String PROVIDER_QODER = "qoder";
     public static final String PROVIDER_QODER_CN = "qodercn";
     public static final String PROVIDER_CLAUDE = "claude";
     public static final String PROVIDER_CODEX = "codex";
+    public static final String PROVIDER_OPENCODE = "opencode";
+    public static final String PROVIDER_PI = "pi";
     public static final String PROVIDER_CURSOR = "cursor";
 
     public static final String MEMORY_MODE_PLATFORM = "platform";
@@ -51,22 +58,32 @@ public class ExecutorLaunchOptionsService {
     public static final String ULTIMATE_MODEL = "ultimate";
     public static final String ULTIMATE_REASONING_EFFORT = "high";
 
-    /** Client kinds an operator may create; the page hides every other kind from the create form. */
-    private static final List<SelectOptionVO> CREATABLE_CLIENT_KINDS = List.of(
-            new SelectOptionVO(CLIENT_KIND_QODER_CLI, "Qoder CLI", "国际版 Qoder CLI 执行器"),
-            new SelectOptionVO(CLIENT_KIND_QODER_CN_CLI, "Qoder CLI CN", "国内版 Qoder CLI 执行器"));
+    /**
+     * One table for every client kind the server knows how to launch. A kind is only creatable when the bundled
+     * runtime has a matching provider and the server has a complete launch path for it; CURSOR_CLI stays readable
+     * for historical rows but is deliberately not creatable because the runtime has no Cursor provider.
+     */
+    private static final List<ProviderDefinition> PROVIDER_DEFINITIONS = List.of(
+            new ProviderDefinition(CLIENT_KIND_QODER_CLI, PROVIDER_QODER, "Qoder CLI",
+                    "executor.option.client.qoder_cli.description", "国际版 Qoder CLI 执行器", true, true, true),
+            new ProviderDefinition(CLIENT_KIND_QODER_CN_CLI, PROVIDER_QODER_CN, "Qoder CLI CN",
+                    "executor.option.client.qoder_cn_cli.description", "国内版 Qoder CLI 执行器", true, true, true),
+            new ProviderDefinition(CLIENT_KIND_CLAUDE_CODE, PROVIDER_CLAUDE, "Claude Code",
+                    "executor.option.client.claude_code.description", "Claude Code 执行器", true, false, false),
+            new ProviderDefinition(CLIENT_KIND_CODEX_CLI, PROVIDER_CODEX, "Codex CLI",
+                    "executor.option.client.codex_cli.description", "Codex CLI 执行器", true, false, false),
+            new ProviderDefinition(CLIENT_KIND_OPENCODE_CLI, PROVIDER_OPENCODE, "OpenCode CLI",
+                    "executor.option.client.opencode_cli.description", "OpenCode CLI 执行器", true, false, false),
+            new ProviderDefinition(CLIENT_KIND_PI_CLI, PROVIDER_PI, "Pi",
+                    "executor.option.client.pi_cli.description", "Pi 执行器", true, false, false),
+            new ProviderDefinition(CLIENT_KIND_CURSOR_CLI, PROVIDER_CURSOR, "Cursor CLI",
+                    "executor.option.client.cursor_cli.description", "历史 Cursor CLI 执行器（暂不支持新建）", false, false, false));
 
-    private static final Map<String, String> PROVIDER_BY_CLIENT_KIND;
-
-    static {
-        Map<String, String> providers = new LinkedHashMap<>();
-        providers.put(CLIENT_KIND_QODER_CN_CLI, PROVIDER_QODER_CN);
-        providers.put(CLIENT_KIND_QODER_CLI, PROVIDER_QODER);
-        providers.put("CLAUDE_CODE", PROVIDER_CLAUDE);
-        providers.put("CODEX_CLI", PROVIDER_CODEX);
-        providers.put("CURSOR_CLI", PROVIDER_CURSOR);
-        PROVIDER_BY_CLIENT_KIND = Map.copyOf(providers);
-    }
+    private static final Map<String, ProviderDefinition> PROVIDER_BY_CLIENT_KIND = buildProviderMap();
+    private static final List<SelectOptionVO> CREATABLE_CLIENT_KINDS = PROVIDER_DEFINITIONS.stream()
+            .filter(ProviderDefinition::creatable)
+            .map(definition -> new SelectOptionVO(definition.clientKind(), definition.label(), definition.description()))
+            .toList();
 
     private static final List<SelectOptionVO> MEMORY_MODES = List.of(
             new SelectOptionVO(MEMORY_MODE_PLATFORM, "平台记忆（推荐）", "由 AutoWonder 注入平台记忆"),
@@ -112,10 +129,11 @@ public class ExecutorLaunchOptionsService {
     }
 
     public static List<SelectOptionVO> creatableClientKinds() {
-        return CREATABLE_CLIENT_KINDS.stream().map(option -> new SelectOptionVO(option.getValue(),
-                option.getLabel(), SystemMessages.render(CLIENT_KIND_QODER_CLI.equals(option.getValue())
-                        ? "executor.option.client.qoder_cli.description" : "executor.option.client.qoder_cn_cli.description",
-                null, option.getDescription()))).toList();
+        return CREATABLE_CLIENT_KINDS.stream().map(option -> {
+            ProviderDefinition definition = PROVIDER_BY_CLIENT_KIND.get(option.getValue());
+            return new SelectOptionVO(option.getValue(), option.getLabel(),
+                    SystemMessages.render(definition.descriptionKey(), null, option.getDescription()));
+        }).toList();
     }
 
     public static List<String> creatableClientKindValues() {
@@ -142,8 +160,8 @@ public class ExecutorLaunchOptionsService {
     }
 
     public static String resolveProvider(String clientKind) {
-        String provider = clientKind == null ? null : PROVIDER_BY_CLIENT_KIND.get(clientKind.trim());
-        return provider == null ? PROVIDER_CLAUDE : provider;
+        ProviderDefinition definition = clientKind == null ? null : PROVIDER_BY_CLIENT_KIND.get(clientKind.trim().toUpperCase(Locale.ROOT));
+        return definition == null ? PROVIDER_CLAUDE : definition.provider();
     }
 
     public static boolean isQoderFamily(String provider) {
@@ -160,8 +178,24 @@ public class ExecutorLaunchOptionsService {
     }
 
     public static boolean isCreatableClientKind(String clientKind) {
-        String canonical = canonicalClientKind(clientKind);
-        return CLIENT_KIND_QODER_CLI.equals(canonical) || CLIENT_KIND_QODER_CN_CLI.equals(canonical);
+        ProviderDefinition definition = clientKind == null ? null
+                : PROVIDER_BY_CLIENT_KIND.get(clientKind.trim().toUpperCase(Locale.ROOT));
+        return definition != null && definition.creatable();
+    }
+
+    /** True when the server refreshes a live model catalog for this provider (currently the Qoder family only). */
+    public static boolean hasModelCatalog(String provider) {
+        return PROVIDER_QODER.equals(provider) || PROVIDER_QODER_CN.equals(provider);
+    }
+
+    /** Qoder requires a catalog model; other CLIs may keep their own default and accept an optional model id. */
+    public static boolean requiresModel(String provider) {
+        return hasModelCatalog(provider);
+    }
+
+    /** The official npm runtime supports Qoder only; the bundled runtime drives the other providers. */
+    public static boolean usesOfficialNpmRuntime(String provider) {
+        return hasModelCatalog(provider);
     }
 
     /**
@@ -170,10 +204,12 @@ public class ExecutorLaunchOptionsService {
      */
     public ExecutorLaunchOptionsVO launchOptions(long tenantId, String clientKind) {
         String canonical = requireCreatableClientKind(clientKind);
-        // requireCreatableClientKind already limits the provider to the Qoder family, so a catalog always applies.
         String provider = resolveProvider(canonical);
-        ProviderModelCatalogVO catalog = liveCatalog(tenantId, provider);
-        List<SelectOptionVO> models = catalog == null ? fallbackModels() : toOptions(catalog.getModels());
+        boolean catalogBacked = hasModelCatalog(provider);
+        ProviderModelCatalogVO catalog = catalogBacked ? liveCatalog(tenantId, provider) : null;
+        List<SelectOptionVO> models = catalogBacked
+                ? (catalog == null ? fallbackModels() : toOptions(catalog.getModels()))
+                : List.of();
         ExecutorLaunchOptionsVO vo = new ExecutorLaunchOptionsVO();
         vo.setClientKind(canonical);
         vo.setProvider(provider);
@@ -184,8 +220,8 @@ public class ExecutorLaunchOptionsService {
         vo.setMemoryModes(MEMORY_MODES.stream().map(option -> new SelectOptionVO(option.getValue(),
                 SystemMessages.render("executor.option.memory." + option.getValue().replace('-', '_') + ".label", null, option.getLabel()),
                 SystemMessages.render("executor.option.memory." + option.getValue().replace('-', '_') + ".description", null, option.getDescription()))).toList());
-        vo.setDefaultModel(chooseModel(models, DEFAULT_MODEL));
-        vo.setDefaultCreateModel(chooseModel(models, AUTO_MODEL));
+        vo.setDefaultModel(catalogBacked ? chooseModel(models, DEFAULT_MODEL) : null);
+        vo.setDefaultCreateModel(catalogBacked ? chooseModel(models, AUTO_MODEL) : null);
         vo.setDefaultReasoningEffort(defaultReasoningEffort(vo.getDefaultModel()));
         vo.setDefaultContextWindow(DEFAULT_CONTEXT_WINDOW);
         vo.setDefaultMemoryMode(DEFAULT_MEMORY_MODE);
@@ -199,7 +235,7 @@ public class ExecutorLaunchOptionsService {
      * the current one.
      */
     public ProviderModelCatalogVO liveCatalog(long tenantId, String provider) {
-        if (!isQoderFamily(provider)) {
+        if (!hasModelCatalog(provider)) {
             return null;
         }
         ProviderModelCatalogVO catalog = readCatalogQuietly(tenantId, provider);
@@ -217,7 +253,7 @@ public class ExecutorLaunchOptionsService {
 
     /** The workspace's live provider catalog when one exists, otherwise the fallback list the page also uses. */
     public List<SelectOptionVO> models(long tenantId, String provider) {
-        if (!isQoderFamily(provider)) {
+        if (!hasModelCatalog(provider)) {
             return List.of();
         }
         ProviderModelCatalogVO catalog = readCatalogQuietly(tenantId, provider);
@@ -334,5 +370,18 @@ public class ExecutorLaunchOptionsService {
     private static BizException invalid(String field, List<String> allowed) {
         return BizException.keyed(ErrorCode.MCP_TOOL_ARGUMENT_INVALID, "executor.option.only_supported",
                 new Object[]{field, String.join("/", allowed)}, field + " 仅支持 " + String.join("/", allowed));
+    }
+
+    private static Map<String, ProviderDefinition> buildProviderMap() {
+        Map<String, ProviderDefinition> definitions = new LinkedHashMap<>();
+        for (ProviderDefinition definition : PROVIDER_DEFINITIONS) {
+            definitions.put(definition.clientKind(), definition);
+        }
+        return Map.copyOf(definitions);
+    }
+
+    private record ProviderDefinition(String clientKind, String provider, String label, String descriptionKey,
+                                      String description, boolean creatable, boolean qoderFamily,
+                                      boolean catalogBacked) {
     }
 }

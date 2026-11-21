@@ -164,29 +164,38 @@ class ExecutorLaunchCommandServiceTest {
     }
 
     @Test
-    void legacyClientKindDropsQoderOnlyFlagsAndModelValues() {
+    void nativeRuntimeKeepsOptionalModelAndDropsQoderOnlyFlags() {
         ExecutorLaunchCommandVO vo = build("awexec_plain", "CLAUDE_CODE", "provider-local", "qmodel_latest",
                 "medium", "260000", "posix", false, null);
 
         assertEquals("claude", vo.getProvider());
-        assertEquals("npx -y @alicloud/autowonder@" + RUNTIME_VERSION + " connect"
+        assertEquals("autowonder-runtime connect"
                 + " --ws-url " + WS_URL
                 + " --token awexec_plain"
                 + " --executor-id 9"
                 + " --provider claude"
-                + " --memory-mode provider-local --max-tasks 5", vo.getCommand());
-        assertNull(vo.getModel());
+                + " --memory-mode provider-local --max-tasks 5"
+                + " --model qmodel_latest", vo.getCommand());
+        assertEquals("qmodel_latest", vo.getModel());
         assertNull(vo.getReasoningEffort());
         assertNull(vo.getContextWindow());
+        assertNull(vo.getRuntimeVersion());
     }
 
     @Test
-    void unknownClientKindFallsBackToTheClaudeProviderLikeThePage() {
-        ExecutorLaunchCommandVO vo = build("awexec_plain", "MYSTERY_CLI", "platform", null,
-                null, null, "posix", false, null);
+    void unknownClientKindIsRejectedInsteadOfFallingBackToClaude() {
+        BizException ex = assertThrows(BizException.class,
+                () -> build("awexec_plain", "MYSTERY_CLI", "platform", null,
+                        null, null, "posix", false, null));
+        assertEquals(ErrorCode.EXECUTOR_CLIENT_KIND_INVALID.getCode(), ex.getCode());
+    }
 
-        assertEquals("claude", vo.getProvider());
-        assertTrue(vo.getCommand().contains("--provider claude"));
+    @Test
+    void cursorIsReadableButCannotGenerateALaunchCommand() {
+        BizException ex = assertThrows(BizException.class,
+                () -> build("awexec_plain", "CURSOR_CLI", "platform", null,
+                        null, null, "posix", false, null));
+        assertEquals(ErrorCode.EXECUTOR_CLIENT_KIND_INVALID.getCode(), ex.getCode());
     }
 
     @Test

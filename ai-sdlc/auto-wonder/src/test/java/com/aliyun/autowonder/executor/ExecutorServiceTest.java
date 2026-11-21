@@ -215,11 +215,10 @@ class ExecutorServiceTest {
 
     @Test
     void create_non_creatable_client_kind_is_rejected_like_the_mcp_entry() {
-        // 工单要求 REST 与 MCP 创建入口校验一致：非 Qoder 系类型不再允许经 REST 落库。
-        // 旧行为是创建成功且启动配置只存记忆模式，与 MCP 入口不一致，本次修复消除。
+        // Cursor 只保留历史数据可读，REST 与 MCP 都不能再创建新的 Cursor 执行器。
         CreateExecutorRequest req = new CreateExecutorRequest();
         req.setName("legacy-cli");
-        req.setClientKind("CLAUDE_CODE");
+        req.setClientKind("CURSOR_CLI");
         req.setMemoryMode("provider-local");
 
         BizException ex = assertThrows(BizException.class, () -> service.create(5L, req, 100L, 7L));

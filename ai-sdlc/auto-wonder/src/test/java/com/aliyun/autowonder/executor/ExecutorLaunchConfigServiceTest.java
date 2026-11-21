@@ -191,8 +191,9 @@ class ExecutorLaunchConfigServiceTest {
     }
 
     @Test void editedRuntimeVersionSurvivesPersistenceAndFormSavesWithoutRevivingLegacyPins() {
-        ExecutorDO row = executor(9L, "CLAUDE_CODE",
-                "{\"memoryMode\":\"platform\",\"runtimeVersion\":\"0.3.9\"}", 4);
+        ExecutorDO row = executor(9L, "QODER_CLI",
+                "{\"memoryMode\":\"platform\",\"model\":\"auto\",\"reasoningEffort\":\"medium\","
+                        + "\"contextWindow\":\"260000\",\"runtimeVersion\":\"0.3.9\"}", 4);
         when(executorDao.findById(9L)).thenReturn(row);
         when(executorDao.updateLaunchConfig(eq(9L), eq(TENANT), anyString(), anyInt(), eq(USER))).thenAnswer(call -> {
             if (!row.getConfigVersion().equals(call.getArgument(3))) return 0;
@@ -203,7 +204,7 @@ class ExecutorLaunchConfigServiceTest {
         var executors = mock(ExecutorService.class);
         var executor = new com.aliyun.autowonder.executor.dto.ExecutorVO();
         executor.setId(9L);
-        executor.setClientKind("CLAUDE_CODE");
+        executor.setClientKind("QODER_CLI");
         when(executors.getDetail(9L, TENANT)).thenReturn(executor);
         when(executors.getToken(9L, TENANT)).thenReturn("test-token");
         var branding = mock(com.aliyun.autowonder.branding.PlatformBrandingService.class);
@@ -226,7 +227,7 @@ class ExecutorLaunchConfigServiceTest {
         assertEquals("0.3.36", saved.getRuntimeVersion());
         assertTrue(saved.getRuntimeVersionPinned());
         assertTrue(service.readStoredConfig(9L, TENANT).getRuntimeVersionPinned());
-        var form = req(6, "none", null, null, null);
+        var form = req(6, "none", "auto", "medium", "260000");
         saved = service.updateConfig(9L, TENANT, form, USER);
         assertEquals("0.3.36", saved.getRuntimeVersion());
         assertTrue(saved.getRuntimeVersionPinned());
@@ -296,13 +297,13 @@ class ExecutorLaunchConfigServiceTest {
     }
 
     @Test
-    void readStoredConfig_returns_only_memory_mode_for_a_non_qoder_executor() {
+    void readStoredConfig_returns_the_persisted_model_for_a_non_qoder_executor() {
         when(executorDao.findById(9L)).thenReturn(executor(9L, "CODEX_CLI",
                 "{\"model\":\"qmodel_38max\",\"memoryMode\":\"provider-local\"}", 2));
 
         ExecutorLaunchConfigVO vo = service.readStoredConfig(9L, TENANT);
 
-        assertNull(vo.getModel());
+        assertEquals("qmodel_38max", vo.getModel());
         assertEquals("provider-local", vo.getMemoryMode());
     }
 
@@ -378,19 +379,21 @@ class ExecutorLaunchConfigServiceTest {
     }
 
     @Test
-    void updateConfig_stores_only_memory_mode_for_a_non_qoder_executor() {
+    void updateConfig_stores_the_optional_model_and_defaults_for_a_non_qoder_executor() {
         when(executorDao.findById(9L)).thenReturn(executor(9L, "CLAUDE_CODE", null, 1));
         when(executorDao.updateLaunchConfig(eq(9L), eq(TENANT), anyString(), eq(1), eq(USER))).thenReturn(1);
 
         ExecutorLaunchConfigVO vo = service.updateConfig(9L, TENANT,
                 req(1, "none", "qmodel_38max", "low", "400000"), USER);
 
-        assertNull(vo.getModel());
+        assertEquals("qmodel_38max", vo.getModel());
+        assertEquals("low", vo.getReasoningEffort());
+        assertEquals("400000", vo.getContextWindow());
         assertEquals("none", vo.getMemoryMode());
         assertEquals(2, vo.getVersion());
         ArgumentCaptor<String> json = ArgumentCaptor.forClass(String.class);
         verify(executorDao).updateLaunchConfig(eq(9L), eq(TENANT), json.capture(), eq(1), eq(USER));
-        assertFalse(json.getValue().contains("model"));
+        assertTrue(json.getValue().contains("\"model\":\"qmodel_38max\""));
         assertTrue(json.getValue().contains("\"memoryMode\":\"none\""));
     }
 
@@ -477,7 +480,7 @@ class ExecutorLaunchConfigServiceTest {
         when(executorDao.findById(9L)).thenReturn(executor(9L, null, null, 1));
 
         BizException ex = assertThrows(BizException.class, () -> service.updateConfig(9L, TENANT,
-                recoveryReq("CLAUDE_CODE", 1, "platform", "qmodel_38max", "medium", "260000"), USER));
+                recoveryReq("CURSOR_CLI", 1, "platform", "qmodel_38max", "medium", "260000"), USER));
         assertEquals("17009", ex.getCode());
         verify(executorDao, never()).updateLaunchConfig(anyLong(), anyLong(), anyString(), anyInt(), anyLong());
         verify(executorDao, never()).updateLaunchConfigWithClientKind(anyLong(), anyLong(), anyString(), anyString(),
@@ -619,14 +622,14 @@ class ExecutorLaunchConfigServiceTest {
     }
 
     @Test
-    void resolveForCreate_stores_only_memory_mode_for_a_non_qoder_client_kind() {
+    void resolveForCreate_stores_the_optional_model_for_a_non_qoder_client_kind() {
         ExecutorLaunchConfigService.LaunchConfig config =
                 service.resolveForCreate(TENANT, create("CLAUDE_CODE", "provider-local", "lite", "low", "400000"));
 
         assertEquals("provider-local", config.memoryMode);
-        assertNull(config.model);
-        assertNull(config.reasoningEffort);
-        assertNull(config.contextWindow);
+        assertEquals("lite", config.model);
+        assertEquals("low", config.reasoningEffort);
+        assertEquals("400000", config.contextWindow);
     }
 
     @Test

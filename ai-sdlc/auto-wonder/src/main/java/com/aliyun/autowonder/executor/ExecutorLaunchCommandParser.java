@@ -24,6 +24,7 @@ final class ExecutorLaunchCommandParser {
         Map<String, String> flags = flags(argv);
         List<String> baselineArgv = words(baseline);
         Map<String, String> expected = flags(baselineArgv);
+        if (!runtimeKind(argv).equals(runtimeKind(baselineArgv))) throw invalid();
         for (String key : List.of("ws-url", "token", "executor-id", "provider", "token-aware-enable")) {
             if (!Objects.equals(flags.get(key), expected.get(key))) {
                 throw BizException.keyed(ErrorCode.PARAM_INVALID, "executor.command.identity_changed", null,
@@ -33,14 +34,14 @@ final class ExecutorLaunchCommandParser {
         for (String key : List.of("memory-mode", "max-tasks", "model", "reasoning-effort", "context-window")) {
             if (expected.containsKey(key) && !flags.containsKey(key)) throw invalid();
         }
-        String runtimeVersion = argv.get(2).substring(argv.get(2).startsWith("@alicloud/")
-                ? "@alicloud/autowonder@".length() : "autowonder@".length());
-        if (!runtimeVersion.matches("(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)")
-                || RuntimeVersion.compare(runtimeVersion, runtimeVersion).isEmpty()) throw invalid();
+        String runtimeVersion = npmVersion(argv);
+        if (runtimeVersion != null && (!runtimeVersion.matches("(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)")
+                || RuntimeVersion.compare(runtimeVersion, runtimeVersion).isEmpty())) throw invalid();
         var result = new UpdateExecutorLaunchConfigRequest();
         result.setVersion(version);
         // 只在版本被明确修改时固定版本，保存其他参数时保留已有的版本选择方式。
-        result.setRuntimeVersion(baselineArgv.get(2).endsWith("@" + runtimeVersion) ? null : runtimeVersion);
+        result.setRuntimeVersion(runtimeVersion != null && runtimeVersion.equals(npmVersion(baselineArgv))
+                ? null : runtimeVersion);
         result.setWorkspaceRoot(flags.getOrDefault("workspace-root", ""));
         result.setDaemonName(flags.getOrDefault("name", ""));
         result.setDebug(flags.containsKey("debug"));
@@ -57,11 +58,9 @@ final class ExecutorLaunchCommandParser {
     }
 
     private static Map<String, String> flags(List<String> argv) {
-        if (argv.size() < 4 || !"npx".equals(argv.get(0))
-                || !("-y".equals(argv.get(1)) || "--yes".equals(argv.get(1)))
-                || !(argv.get(2).startsWith("autowonder@") || argv.get(2).startsWith("@alicloud/autowonder@")) || !"connect".equals(argv.get(3))) throw invalid();
+        int start = flagsStart(argv);
         Map<String, String> result = new HashMap<>();
-        for (int index = 4; index < argv.size(); index++) {
+        for (int index = start; index < argv.size(); index++) {
             String argument = argv.get(index);
             if (!argument.startsWith("--")) throw invalid();
             String[] pair = argument.substring(2).split("=", 2);
@@ -78,6 +77,29 @@ final class ExecutorLaunchCommandParser {
             if (result.putIfAbsent(key, value) != null) throw invalid();
         }
         return result;
+    }
+
+    private static int flagsStart(List<String> argv) {
+        if (argv.size() >= 4 && "npx".equals(argv.get(0))
+                && ("-y".equals(argv.get(1)) || "--yes".equals(argv.get(1)))
+                && (argv.get(2).startsWith("autowonder@") || argv.get(2).startsWith("@alicloud/autowonder@"))
+                && "connect".equals(argv.get(3))) {
+            return 4;
+        }
+        if (argv.size() >= 2 && "autowonder-runtime".equals(argv.get(0)) && "connect".equals(argv.get(1))) {
+            return 2;
+        }
+        throw invalid();
+    }
+
+    private static String runtimeKind(List<String> argv) {
+        return "npx".equals(argv.get(0)) ? "npm" : "native";
+    }
+
+    private static String npmVersion(List<String> argv) {
+        if (!"npx".equals(argv.get(0))) return null;
+        String spec = argv.get(2);
+        return spec.substring(spec.startsWith("@alicloud/") ? "@alicloud/autowonder@".length() : "autowonder@".length());
     }
 
     private static List<String> words(String command) {
@@ -123,6 +145,6 @@ final class ExecutorLaunchCommandParser {
 
     private static BizException invalid() {
         return BizException.keyed(ErrorCode.PARAM_INVALID, "executor.command.invalid", null,
-                "启动命令格式无效，请使用固定版本的 npx connect 命令和受支持的启动参数，不使用其他 Shell 命令");
+                "启动命令格式无效，请使用 autowonder-runtime connect 或固定版本的 npx connect 命令和受支持的启动参数，不使用其他 Shell 命令");
     }
 }

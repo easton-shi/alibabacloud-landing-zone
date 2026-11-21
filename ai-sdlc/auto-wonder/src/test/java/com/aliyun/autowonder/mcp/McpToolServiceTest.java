@@ -5592,7 +5592,8 @@ class McpToolServiceTest {
         assertEquals(List.of("workspaceId", "agentId", "name", "clientKind"),
                 schemaFor("autowonder.create_executor").get("required"));
 
-        List<String> clientKinds = List.of("QODER_CLI", "QODER_CN_CLI");
+        List<String> clientKinds = List.of("QODER_CLI", "QODER_CN_CLI", "CLAUDE_CODE", "CODEX_CLI",
+                "OPENCODE_CLI", "PI_CLI");
         assertEquals(clientKinds, enumValues("autowonder.create_executor", "clientKind"));
         assertEquals(clientKinds, enumValues("autowonder.get_executor_launch_options", "clientKind"));
         // 历史缺类型执行器的恢复入口与创建入口共用同一套可创建类型枚举
@@ -5848,13 +5849,13 @@ class McpToolServiceTest {
 
     @Test
     @SuppressWarnings("unchecked")
-    void listExecutorClientKindsOffersOnlyTheCreatableQoderFamily() {
+    void listExecutorClientKindsOffersEveryCreatableProviderButNotCursor() {
         List<SelectOptionVO> kinds =
                 (List<SelectOptionVO>) call(principal, "autowonder.list_executor_client_kinds", Map.of());
 
-        assertEquals(List.of("QODER_CLI", "QODER_CN_CLI"),
+        assertEquals(List.of("QODER_CLI", "QODER_CN_CLI", "CLAUDE_CODE", "CODEX_CLI", "OPENCODE_CLI", "PI_CLI"),
                 kinds.stream().map(SelectOptionVO::getValue).toList());
-        assertEquals(List.of("Qoder CLI", "Qoder CLI CN"),
+        assertEquals(List.of("Qoder CLI", "Qoder CLI CN", "Claude Code", "Codex CLI", "OpenCode CLI", "Pi"),
                 kinds.stream().map(SelectOptionVO::getLabel).toList());
         verifyNoInteractions(executorService);
     }
@@ -5886,12 +5887,25 @@ class McpToolServiceTest {
     }
 
     @Test
-    void getExecutorLaunchOptionsRejectsClientKindsThePageHides() {
+    void getExecutorLaunchOptionsRejectsCursorWhichThePageCannotCreate() {
         BizException exception = assertThrows(BizException.class, () -> call(principal,
-                "autowonder.get_executor_launch_options", Map.of("clientKind", "CLAUDE_CODE")));
+                "autowonder.get_executor_launch_options", Map.of("clientKind", "CURSOR_CLI")));
 
         assertEquals("27003", exception.getCode());
         assertTrue(exception.getMessage().contains("clientKind 仅支持 QODER_CLI/QODER_CN_CLI"));
+        verifyNoInteractions(providerModelCatalogService);
+    }
+
+    @Test
+    void getExecutorLaunchOptionsReturnsNoCatalogForNativeAgents() {
+        ExecutorLaunchOptionsVO options = (ExecutorLaunchOptionsVO) call(principal,
+                "autowonder.get_executor_launch_options", Map.of("clientKind", "CODEX_CLI"));
+
+        assertEquals("CODEX_CLI", options.getClientKind());
+        assertEquals("codex", options.getProvider());
+        assertTrue(options.getModels().isEmpty());
+        assertNull(options.getDefaultModel());
+        assertNull(options.getDefaultCreateModel());
         verifyNoInteractions(providerModelCatalogService);
     }
 
@@ -5955,8 +5969,6 @@ class McpToolServiceTest {
     void createExecutorRejectsNonCreatableClientKinds() {
         McpAccessTokenService.Principal admin = principal(WorkspaceAccessLevel.ADMIN);
         List<Map<String, Object>> cases = List.of(
-                Map.of("agentId", 5L, "name", "n", "clientKind", "CLAUDE_CODE"),
-                Map.of("agentId", 5L, "name", "n", "clientKind", "CODEX_CLI"),
                 Map.of("agentId", 5L, "name", "n", "clientKind", "CURSOR_CLI"));
 
         for (Map<String, Object> args : cases) {
@@ -5968,6 +5980,25 @@ class McpToolServiceTest {
 
         // 客户端类型不合法时不能留下一个已创建的执行器和一个已签发的 Token
         verify(executorService, never()).create(anyLong(), any(), anyLong(), anyLong());
+        verifyNoInteractions(providerModelCatalogService);
+    }
+
+    @Test
+    void createExecutorAcceptsNativeAgentsWithAnOptionalModel() {
+        McpAccessTokenService.Principal admin = principal(WorkspaceAccessLevel.ADMIN);
+        when(executorService.create(eq(5L), any(CreateExecutorRequest.class), eq(WORKSPACE_ID), eq(USER_ID)))
+                .thenReturn(issued(9L, 5L, "dev-machine-01", "awexec_plain", "CODEX_CLI",
+                        "provider-local", "openai/gpt-5.1-codex", null, null));
+
+        CreatedExecutorVO created = (CreatedExecutorVO) call(admin, "autowonder.create_executor",
+                Map.of("agentId", 5L, "name", "dev-machine-01", "clientKind", "CODEX_CLI",
+                        "memoryMode", "provider-local", "model", "openai/gpt-5.1-codex"));
+
+        assertEquals("CODEX_CLI", created.getClientKind());
+        assertEquals("openai/gpt-5.1-codex", created.getModel());
+        ArgumentCaptor<CreateExecutorRequest> captor = ArgumentCaptor.forClass(CreateExecutorRequest.class);
+        verify(executorService).create(eq(5L), captor.capture(), eq(WORKSPACE_ID), eq(USER_ID));
+        assertEquals("openai/gpt-5.1-codex", captor.getValue().getModel());
         verifyNoInteractions(providerModelCatalogService);
     }
 
@@ -6345,7 +6376,7 @@ class McpToolServiceTest {
 
         List<SelectOptionVO> kinds =
                 (List<SelectOptionVO>) call(admin, "autowonder.list_executor_client_kinds", Map.of());
-        assertEquals(List.of("QODER_CLI", "QODER_CN_CLI"),
+        assertEquals(List.of("QODER_CLI", "QODER_CN_CLI", "CLAUDE_CODE", "CODEX_CLI", "OPENCODE_CLI", "PI_CLI"),
                 kinds.stream().map(SelectOptionVO::getValue).toList());
     }
 

@@ -8,6 +8,17 @@ client runtimes. SIGAR metrics are enabled on Linux x86_64 and degrade to an
 empty optional capability when unavailable. Set `AUTOWONDER_SIGAR_ENABLED=false`
 to disable them explicitly.
 
+### Fork add-on: reverse-engineered executor runtime
+
+This fork also contains an independent Go executor at
+[`../../runtime/`](../../runtime/README.md). It is not an Alibaba Cloud official
+release and is not required to run the Community server. The runtime connects to
+`/ws/executor`, materializes dispatched repositories, invokes one of Codex,
+OpenCode, Pi, or Claude Code, and uploads deliverables through the protocol
+documented in [`../scheduler-executor-protocol.md`](../scheduler-executor-protocol.md).
+Its supported commands, environment variables, Docker image, and current
+limitations are listed in the runtime README.
+
 Required services are MySQL 8, Redis, and an OSS-compatible Alibaba Cloud OSS
 bucket. OSS does not fall back to local memory. SLS is a supported public cloud
 integration and is enabled with configuration rather than replaced by an

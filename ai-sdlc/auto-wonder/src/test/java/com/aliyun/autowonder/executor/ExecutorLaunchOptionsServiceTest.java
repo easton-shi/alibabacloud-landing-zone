@@ -130,12 +130,30 @@ class ExecutorLaunchOptionsServiceTest {
 
     @Test
     void launchOptionsRejectsClientKindsTheCreateFormHides() {
-        for (String clientKind : new String[]{"CLAUDE_CODE", "CODEX_CLI", "CURSOR_CLI", "QODER_WEB", null, " "}) {
+        for (String clientKind : new String[]{"CURSOR_CLI", "QODER_WEB", null, " "}) {
             BizException ex = assertThrows(BizException.class, () -> service.launchOptions(WORKSPACE, clientKind),
                     String.valueOf(clientKind));
             assertEquals("27003", ex.getCode(), String.valueOf(clientKind));
-            assertTrue(ex.getMessage().contains("clientKind 仅支持 QODER_CLI/QODER_CN_CLI"), ex.getMessage());
+            assertTrue(ex.getMessage().contains("QODER_CLI/QODER_CN_CLI/CLAUDE_CODE/CODEX_CLI/OPENCODE_CLI/PI_CLI"),
+                    ex.getMessage());
         }
+        verify(modelCatalogService, never()).read(anyLong(), anyString());
+    }
+
+    @Test
+    void launchOptionsForACliProviderUsesItsOwnDefaultModelAndNoCatalog() {
+        ExecutorLaunchOptionsVO codex = service.launchOptions(WORKSPACE, "CODEX_CLI");
+        ExecutorLaunchOptionsVO openCode = service.launchOptions(WORKSPACE, "opencode_cli");
+        ExecutorLaunchOptionsVO pi = service.launchOptions(WORKSPACE, "PI_CLI");
+
+        assertEquals("codex", codex.getProvider());
+        assertEquals("opencode", openCode.getProvider());
+        assertEquals("pi", pi.getProvider());
+        assertEquals(List.of(), codex.getModels());
+        assertNull(codex.getDefaultModel());
+        assertNull(codex.getDefaultCreateModel());
+        assertEquals("medium", codex.getDefaultReasoningEffort());
+        assertEquals("260000", codex.getDefaultContextWindow());
         verify(modelCatalogService, never()).read(anyLong(), anyString());
     }
 
@@ -154,9 +172,10 @@ class ExecutorLaunchOptionsServiceTest {
     }
 
     @Test
-    void creatableClientKindsExposeOnlyTheQoderCliFamily() {
-        assertEquals(List.of("QODER_CLI", "QODER_CN_CLI"), ExecutorLaunchOptionsService.creatableClientKindValues());
-        assertEquals(List.of("Qoder CLI", "Qoder CLI CN"),
+    void creatableClientKindsExposeEveryRuntimeBackedProviderButNotCursor() {
+        assertEquals(List.of("QODER_CLI", "QODER_CN_CLI", "CLAUDE_CODE", "CODEX_CLI", "OPENCODE_CLI", "PI_CLI"),
+                ExecutorLaunchOptionsService.creatableClientKindValues());
+        assertEquals(List.of("Qoder CLI", "Qoder CLI CN", "Claude Code", "Codex CLI", "OpenCode CLI", "Pi"),
                 ExecutorLaunchOptionsService.creatableClientKinds().stream()
                         .map(SelectOptionVO::getLabel).toList());
         assertEquals("国际版 Qoder CLI 执行器",
@@ -178,6 +197,8 @@ class ExecutorLaunchOptionsServiceTest {
         assertEquals("qodercn", ExecutorLaunchOptionsService.resolveProvider("QODER_CN_CLI"));
         assertEquals("claude", ExecutorLaunchOptionsService.resolveProvider("CLAUDE_CODE"));
         assertEquals("codex", ExecutorLaunchOptionsService.resolveProvider("CODEX_CLI"));
+        assertEquals("opencode", ExecutorLaunchOptionsService.resolveProvider("OPENCODE_CLI"));
+        assertEquals("pi", ExecutorLaunchOptionsService.resolveProvider("PI_CLI"));
         assertEquals("cursor", ExecutorLaunchOptionsService.resolveProvider("CURSOR_CLI"));
         assertEquals("claude", ExecutorLaunchOptionsService.resolveProvider("UNKNOWN"));
         assertEquals("claude", ExecutorLaunchOptionsService.resolveProvider(null));
@@ -189,7 +210,11 @@ class ExecutorLaunchOptionsServiceTest {
         assertNull(ExecutorLaunchOptionsService.canonicalClientKind("QODER_WEB"));
         assertNull(ExecutorLaunchOptionsService.canonicalClientKind(null));
         assertTrue(ExecutorLaunchOptionsService.isCreatableClientKind("Qoder_Cn_Cli"));
-        assertFalse(ExecutorLaunchOptionsService.isCreatableClientKind("CLAUDE_CODE"));
+        assertTrue(ExecutorLaunchOptionsService.isCreatableClientKind("CLAUDE_CODE"));
+        assertTrue(ExecutorLaunchOptionsService.isCreatableClientKind("CODEX_CLI"));
+        assertTrue(ExecutorLaunchOptionsService.isCreatableClientKind("OPENCODE_CLI"));
+        assertTrue(ExecutorLaunchOptionsService.isCreatableClientKind("PI_CLI"));
+        assertFalse(ExecutorLaunchOptionsService.isCreatableClientKind("CURSOR_CLI"));
         assertTrue(ExecutorLaunchOptionsService.isQoderFamily("qoder"));
         assertTrue(ExecutorLaunchOptionsService.isQoderFamily("qodercn"));
         assertFalse(ExecutorLaunchOptionsService.isQoderFamily("claude"));

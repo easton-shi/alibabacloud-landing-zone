@@ -92,6 +92,8 @@ const MOCK_PROVIDERS: Record<string, string> = {
   QODER_CLI: 'qoder',
   CLAUDE_CODE: 'claude',
   CODEX_CLI: 'codex',
+  OPENCODE_CLI: 'opencode',
+  PI_CLI: 'pi',
   CURSOR_CLI: 'cursor',
 };
 
@@ -140,12 +142,15 @@ function buildMockLaunchCommand(id: number, stored: StoredLaunchConfig, fixture:
   os: string, debug: boolean, shell: string | null): Record<string, unknown> {
   const provider = mockProviderFor(fixture.clientKind);
   const isQoder = isQoderProvider(provider);
-  const runtimeVersion = stored.runtimeVersionPinned && stored.runtimeVersion ? stored.runtimeVersion : MOCK_RUNTIME_VERSION;
-  const [major, minor, patch] = runtimeVersion.split('.').map(Number);
+  // 与 ExecutorLaunchCommandService 一致：Qoder 走官方 npm Runtime，其他 Agent 走自研 Runtime。
+  const runtimeVersion = isQoder
+    ? (stored.runtimeVersionPinned && stored.runtimeVersion ? stored.runtimeVersion : MOCK_RUNTIME_VERSION)
+    : null;
+  const [major, minor, patch] = (runtimeVersion ?? MOCK_RUNTIME_VERSION).split('.').map(Number);
   const packageName = major > 0 || minor > 3 || (minor === 3 && patch >= 33)
     ? '@alicloud/autowonder' : 'autowonder';
   const argv = [
-    'npx', '-y', `${packageName}@${runtimeVersion}`, 'connect',
+    ...(isQoder ? ['npx', '-y', `${packageName}@${runtimeVersion}`, 'connect'] : ['autowonder-runtime', 'connect']),
     '--ws-url', MOCK_WS_URL,
     '--token', fixture.token,
     '--executor-id', String(id),
@@ -157,6 +162,8 @@ function buildMockLaunchCommand(id: number, stored: StoredLaunchConfig, fixture:
       '--reasoning-effort', stored.reasoningEffort as string,
       '--context-window', stored.contextWindow as string,
       '--token-aware-enable');
+  } else if (stored.model) {
+    argv.push('--model', stored.model);
   }
   if (stored.workspaceRoot) argv.push('--workspace-root', `'${stored.workspaceRoot.replace(/'/g, "'\\''")}'`);
   if (stored.daemonName) argv.push('--name', `'${stored.daemonName.replace(/'/g, "'\\''")}'`);
@@ -169,7 +176,7 @@ function buildMockLaunchCommand(id: number, stored: StoredLaunchConfig, fixture:
     clientKind: fixture.clientKind,
     provider,
     memoryMode: stored.memoryMode,
-    model: isQoder ? stored.model : null,
+    model: stored.model ?? null,
     reasoningEffort: isQoder ? stored.reasoningEffort : null,
     contextWindow: isQoder ? stored.contextWindow : null,
     wsUrl: MOCK_WS_URL,
@@ -229,6 +236,15 @@ export async function resolveLaunchCommand({ params, request }: {
       success: false,
       code: '17011',
       message: '该执行器缺少客户端类型，无法生成启动命令',
+      data: null,
+      traceId: null,
+    });
+  }
+  if (mockProviderFor(fixture.clientKind) === 'cursor') {
+    return HttpResponse.json({
+      success: false,
+      code: '17009',
+      message: '客户端类型不合法，仅支持 QODER_CLI/QODER_CN_CLI/CLAUDE_CODE/CODEX_CLI/OPENCODE_CLI/PI_CLI',
       data: null,
       traceId: null,
     });

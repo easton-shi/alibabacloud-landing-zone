@@ -1,0 +1,7 @@
+.git
+bin
+dist
+.cache
+*.log
+workspace
+mcp.config.json

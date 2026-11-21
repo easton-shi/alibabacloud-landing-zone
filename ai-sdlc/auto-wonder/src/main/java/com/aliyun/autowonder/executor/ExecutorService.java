@@ -220,7 +220,7 @@ public class ExecutorService {
                 continue;
             }
             String provider = ProviderModelCatalogService.providerForClientKind(vo.getClientKind());
-            if (provider == null) {
+            if (provider == null || !ExecutorLaunchOptionsService.hasModelCatalog(provider)) {
                 continue;
             }
             String name = namesByProvider.computeIfAbsent(provider, key -> catalogNames(tenantId, key))
