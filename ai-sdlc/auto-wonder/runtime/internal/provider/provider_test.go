@@ -1,10 +1,15 @@
 package provider
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -133,3 +138,187 @@ func TestOpenCodeConfigContent(t *testing.T) {
 		t.Fatalf("missing mcp key: %s", content)
 	}
 }
+
+func TestCodexMCPProjectionKeepsBearerTokenOutOfArgs(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "mcp.json")
+	raw := `{"mcpServers":{
+  "autowonder":{"type":"http","url":"https://autowonder.example/api/mcp","headers":{"Authorization":"Bearer super-secret"}},
+  "local":{"command":"local-mcp","args":["--stdio"]}
+}}`
+	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	args, env, err := buildCodexMCPProjection(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, arg := range args {
+		if strings.Contains(arg, "super-secret") {
+			t.Fatalf("bearer token leaked into argv: %q", args)
+		}
+	}
+	if !strings.Contains(strings.Join(args, "\n"), "bearer_token_env_var") {
+		t.Fatalf("bearer token env var missing: %q", args)
+	}
+	if len(env) != 1 || env["AUTOWONDER_MCP_TOKEN_AUTOWONDER"] != "super-secret" {
+		t.Fatalf("mcp environment = %#v", env)
+	}
+}
+
+type recordingWriteCloser struct {
+	buffer bytes.Buffer
+	err    error
+	order  *[]string
+}
+
+func (w *recordingWriteCloser) Write(p []byte) (int, error) {
+	if w.order != nil {
+		*w.order = append(*w.order, "write")
+	}
+	if w.err != nil {
+		return 0, w.err
+	}
+	return w.buffer.Write(p)
+}
+
+func (w *recordingWriteCloser) Close() error { return nil }
+
+func TestCodexApprovalOnlyApprovesExplicitAllow(t *testing.T) {
+	tests := []struct {
+		name   string
+		answer InputAnswer
+		ok     bool
+		want   string
+	}{
+		{name: "accept", answer: InputAnswer{Action: "accept"}, ok: true, want: "approved"},
+		{name: "approve", answer: InputAnswer{Action: "approve"}, ok: true, want: "approved"},
+		{name: "decline", answer: InputAnswer{Action: "decline"}, ok: true, want: "denied"},
+		{name: "cancel", answer: InputAnswer{Action: "cancel"}, ok: true, want: "denied"},
+		{name: "no answer", ok: false, want: "denied"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			stdin := &recordingWriteCloser{}
+			client := &codexClient{
+				stdin: stdin,
+				emit:  func(Event) {},
+				ask: func(context.Context, InputRequest) (InputAnswer, error) {
+					if !test.ok {
+						return InputAnswer{}, errors.New("input unavailable")
+					}
+					return test.answer, nil
+				},
+			}
+
+			client.handleServerRequest(7, "item/permissions/requestApproval", json.RawMessage(`{"message":"allow?"}`))
+
+			var response struct {
+				Result struct {
+					Decision string `json:"decision"`
+				} `json:"result"`
+			}
+			if err := json.Unmarshal(bytes.TrimSpace(stdin.buffer.Bytes()), &response); err != nil {
+				t.Fatalf("decode response: %v; raw=%s", err, stdin.buffer.String())
+			}
+			if response.Result.Decision != test.want {
+				t.Fatalf("decision = %q, want %q", response.Result.Decision, test.want)
+			}
+		})
+	}
+}
+
+func TestCodexAcknowledgesAnswerOnlyAfterWrite(t *testing.T) {
+	var order []string
+	stdin := &recordingWriteCloser{order: &order}
+	client := &codexClient{
+		stdin: stdin,
+		emit:  func(Event) {},
+		ask: func(context.Context, InputRequest) (InputAnswer, error) {
+			return InputAnswer{
+				Action: "accept",
+				Written: func(err error) {
+					order = append(order, "ack")
+					if err != nil {
+						t.Fatalf("unexpected write error: %v", err)
+					}
+				},
+			}, nil
+		},
+	}
+
+	client.handleServerRequest(8, "item/permissions/requestApproval", json.RawMessage(`{"message":"allow?"}`))
+
+	if !slices.Equal(order, []string{"write", "ack"}) {
+		t.Fatalf("write/ack order = %v", order)
+	}
+}
+
+func TestCodexReportsAnswerWriteFailure(t *testing.T) {
+	writeErr := errors.New("write failed")
+	stdin := &recordingWriteCloser{err: writeErr}
+	var reported error
+	client := &codexClient{
+		stdin: stdin,
+		emit:  func(Event) {},
+		ask: func(context.Context, InputRequest) (InputAnswer, error) {
+			return InputAnswer{
+				Action: "accept",
+				Written: func(err error) {
+					reported = err
+				},
+			}, nil
+		},
+	}
+
+	client.handleServerRequest(9, "item/permissions/requestApproval", json.RawMessage(`{"message":"allow?"}`))
+
+	if !errors.Is(reported, writeErr) {
+		t.Fatalf("reported write error = %v, want %v", reported, writeErr)
+	}
+}
+
+func TestMergeEnvironmentOverridesCaseInsensitively(t *testing.T) {
+	got, err := MergeEnvironment(
+		[]string{"PATH=/base", "API_KEY=old", "UNCHANGED=yes"},
+		map[string]string{"path": "/platform", "api_key": "new", "NEW_VALUE": "present"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"UNCHANGED=yes", "API_KEY=new", "NEW_VALUE=present", "PATH=/platform"}
+	slices.Sort(got)
+	slices.Sort(want)
+	if !slices.Equal(got, want) {
+		t.Fatalf("merged environment = %v, want %v", got, want)
+	}
+}
+
+func TestValidateTaskEnvironmentRejectsRuntimeReservedNames(t *testing.T) {
+	for _, name := range []string{"CODEX_HOME", "AUTOWONDER_WORKSPACE_ROOT", "Claude_Config_Dir"} {
+		if err := ValidateTaskEnvironment(map[string]string{name: "value"}); err == nil {
+			t.Fatalf("reserved variable %q was accepted", name)
+		}
+	}
+}
+
+func TestMergeEnvironmentRejectsMalformedName(t *testing.T) {
+	if _, err := MergeEnvironment(nil, map[string]string{"BAD-NAME": "value"}); err == nil {
+		t.Fatal("malformed environment name was accepted")
+	}
+}
+
+func TestMergeEnvironmentAllowsRuntimeOwnedEntries(t *testing.T) {
+	got, err := MergeEnvironment(nil, map[string]string{
+		"AUTOWONDER_DISPATCH_ID": "42",
+		"CODEX_HOME":             "/managed/codex-home",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("environment = %v", got)
+	}
+}
+
+var _ io.WriteCloser = (*recordingWriteCloser)(nil)

@@ -113,3 +113,37 @@ func TestBuildConversationListsLazyRepositoriesWithoutCloning(t *testing.T) {
 		t.Fatalf("lazy repo reported as checked out:\n%s", prompt)
 	}
 }
+
+func TestBuildIncludesLocalCompletionProtocol(t *testing.T) {
+	root := t.TempDir()
+	packageDir := filepath.Join(root, "package")
+	if err := os.MkdirAll(packageDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	box := &capsule.Capsule{
+		Root: root, PackageDir: packageDir,
+		WorkspaceDir: filepath.Join(root, "workspace"),
+		ArtifactsDir: filepath.Join(root, "artifacts", "output"),
+	}
+	prompt, err := Build(box, BuildWork{
+		LocalAPIEndpoint:        "http://127.0.0.1:4567",
+		DispatchID:              42,
+		StepID:                  "700001",
+		StepAttempt:             2,
+		ArtifactProtocolVersion: 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{
+		"http://127.0.0.1:4567/dispatches/42/step-events",
+		"completion_requested",
+		"evidenceRefs",
+		"HTTP 202",
+		`"stepAttempt":2`,
+	} {
+		if !strings.Contains(prompt, expected) {
+			t.Fatalf("prompt missing %q:\n%s", expected, prompt)
+		}
+	}
+}

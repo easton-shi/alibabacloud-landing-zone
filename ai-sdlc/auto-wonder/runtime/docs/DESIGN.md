@@ -226,6 +226,24 @@ Provider 只负责“怎样启动 CLI、怎样解析 stdout、怎样恢复会话
 - `--output-format stream-json --verbose`。
 - 从 `assistant.message.content[]` 提取文本，从 `result` 提取最终摘要。
 
+### Steering 与 Guidance
+
+Runtime 向服务端声明 `terminal_steer_v1`。`TASK_STEER` 和 `TASK_GUIDANCE` 都作用于活跃的
+dispatch turn。`TASK_STEER` 是终止式 steering（对应 Java 的 `DispatchGuidanceService`），
+`TASK_GUIDANCE` 是非终止式 guidance（`mode=SAFE_STEER`，对应 Java 的 `GuidanceService`）。
+
+四个 provider 都实现 `provider.Steerable`：
+
+- Codex：使用原生 `turn/steer`，不取消当前 turn。
+- OpenCode：CLI 取消当前 turn 后用 `--session` 恢复；ACP 取消当前 prompt 后用
+  `session/load` 恢复。
+- Pi：取消当前 turn 后用 `--session` 恢复。
+- Claude Code：取消当前 turn 后用 `--resume` 恢复。
+
+Runtime 对 `TASK_STEER`/`TASK_GUIDANCE` 进行去重，缓存 ACK，并在重复投递时重放。
+无活跃 turn 或 provider 不支持 steering 时返回 `FAILED` ACK。`TASK_GUIDANCE` 使用
+`TASK_GUIDANCE_ACK`，`TASK_STEER` 使用 `TASK_STEER_ACK`。
+
 ## 8. 协议帧
 
 字段来源：
@@ -348,15 +366,20 @@ Content-Type: multipart/form-data
 - `files`：文件内容；
 - `filesMetadata`：`[{name,sizeBytes,sha256}]`。
 
-Runtime 遍历 `artifacts/output/**`，把逻辑名写成
-`artifacts/output/<relative-path>`。这和服务端 `DaemonArtifactController.logicalPath`
-以及下一轮 `TaskPackager` 查找
-`deliverables/runtime-source-revision.json` 的规则一致。
+Agent 通过本地 `/dispatches/<id>/step-events` 提交 `completion_requested.evidenceRefs`。
+Runtime 只发布这些相对路径对应的普通文件，并追加
+`deliverables/runtime-source-revision.json`。逻辑名仍是
+`artifacts/output/<relative-path>`。旧协议未提供 `artifactProtocolVersion=2` 时保留整树兼容模式。
 
 ## 10. 安全模型
 
 - 执行器 token 只从环境变量读取，不写日志、不写 workspace 文件。
 - Dispatch MCP token 只写入 `0600` 的 `mcp.config.json`，随 dispatch 目录删除。
+- 平台环境变量快照不写入 Git hook 上下文文件；Runtime 保留变量由 Runtime 自己注入。
+- 会话附件只接受服务端 origin、`*.aliyuncs.com` 或显式配置 host，且只解析
+  `User message:` 之前的服务端 manifest。
+- Dispatch result、会话事件和人工答案 ACK 使用 `0600` 原子 outbox，并在 ACK 后删除。
+- Codex 审批只有明确的 `approve` / `accept` 才会放行；拒绝、取消、超时和写入失败均 fail-closed。
 - 任务包解压做路径穿越和 symlink 防护。
 - 仓库名和 path 必须是单路径段。
 - Agent 运行在专属 OS 用户或容器中，不直接以 root 运行。
@@ -368,6 +391,8 @@ Runtime 遍历 `artifacts/output/**`，把逻辑名写成
 - Debug log 会记录 runtime 生命周期、Agent 归一化事件和原始 stdout/stderr；已知的
   执行器 token、dispatch token、MCP secret 和敏感环境变量会在写盘前替换为 `***`。
 - Checkpoint 只保存已提交的仓库 commit；未提交的工作区改动不会随暂停恢复。
+- 工作区 GC 只删除带终态标记且超过 TTL 的 dispatch capsule；pending result outbox、
+  活跃 dispatch 和活跃会话始终保留。会话目录在每轮结束时刷新活动时间。
 
 ## 11. 扩展点
 
@@ -377,19 +402,20 @@ Runtime 遍历 `artifacts/output/**`，把逻辑名写成
 2. Checkpoint：`TASK_PAUSE` 时上传 tar.gz checkpoint，`TASK_PAUSED` 携带 seq/sha256；resume 时按 commit 恢复。
 3. 任务包签名：使用 dispatch 中的 issuer/signatureRef/signature 校验 ZIP 归档。
 4. Hooks：解析并校验 `hooks.json` / `hook.yaml`，执行 7 个生命周期事件；Git 事件通过
-   `core.hooksPath` 安装并链式调用仓库原钩子。`beforeTool` / `afterTool` 未声明。
+   `core.hooksPath` 安装并链式调用仓库原钩子。Claude Code 支持 `beforeTool` / `afterTool`。
 5. Memory：snapshot 注入、changes / mutations / recalls / maintenance lease 透传。
-6. 人工门禁：Codex app-server 原生 RPC 已桥接；其他 provider 使用 loopback request-input。
+6. 人工门禁：Codex app-server 原生 RPC 已桥接；OpenCode ACP 可用时也桥接原生权限卡，
+   其他 provider 使用 loopback request-input。
 7. 重启：`EXECUTOR_RESTART_V1`、`EXECUTOR_RESTART_POLICY_V1`、`EXECUTOR_LAUNCH_COMMAND_V1`。
 8. 会话：`CONVERSATION_TURN_EVENT`、`CONVERSATION_TURN_CANCEL`、`CONVERSATION_COMPUTE_INVENTORY_V1`；
-   Codex 额外实现 `CONVERSATION_ACP_INTERACTION_V1` 的问答卡闭环。
+   Codex / OpenCode ACP 实现 `CONVERSATION_ACP_INTERACTION_V1`；附件和可靠 outbox 已接入。
+9. 自更新：签名 release source、目标版本/时效校验、候选 `--version` 自检、原子替换、
+   启动版本不匹配回滚和升级 receipt。
 
 仍待补齐：
 
-1. `beforeTool` / `afterTool` 的 provider 原生拦截（当前不声明 `TASK_PACKAGE_TOOL_HOOKS_V1`）。
-2. OpenCode / Pi / Claude 原生审批桥接（当前只有 loopback request-input）。
-3. `EXECUTOR_UPDATE_V1` / `EXECUTOR_UPDATE_RESTART_V1`：需要明确的发布源、校验和回滚机制。
-4. 会话附件清单、在线产物回传和行动计划（`ATTACHMENT_MANIFEST_V1` / `ARTIFACT_OUTPUT_V1` / `ACTION_PLAN_V1`）。
-5. OpenCode / Pi / Claude 的 ACP 交互；当前只有 Codex 声明 `CONVERSATION_ACP_INTERACTION_V1`。
-6. 会话可靠投递：`CONVERSATION_DELIVERY_ACK_V1` / `CONVERSATION_ANSWER_DELIVERY_V1` 需要跨重连的 outbox；当前不声明。
-7. 更细的 lazy 生命周期：例如会话内已克隆仓库的过期清理与并发去重。
+1. Codex / OpenCode / Pi 的 `beforeTool` / `afterTool` 原生拦截。
+2. Pi / Claude 原生审批桥接（当前只有 loopback request-input）。
+3. 在线产物回传和行动计划（`ARTIFACT_OUTPUT_V1` / `ACTION_PLAN_V1`）。
+4. Pi / Claude 的 ACP 交互；当前只有 Codex / OpenCode ACP 声明该能力。
+5. 更细的 lazy 生命周期：例如会话内已克隆仓库的过期清理与并发去重。

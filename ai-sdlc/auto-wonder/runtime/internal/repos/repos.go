@@ -273,9 +273,6 @@ type revisionDocument struct {
 
 // WriteRevision records the final branches and commits after the agent runs.
 func WriteRevision(ctx context.Context, checkouts []Checkout, path string) error {
-	if len(checkouts) == 0 {
-		return nil
-	}
 	document := revisionDocument{
 		SchemaVersion: "autowonder.runtimeSourceRevision.v1",
 		Repositories:  make([]Revision, 0, len(checkouts)),

@@ -13,6 +13,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
+	"strconv"
 	"sync"
 	"time"
 
@@ -44,33 +46,48 @@ type deliveryKey struct {
 // Handler owns conversation concurrency and ACP reply routing. It survives
 // WebSocket reconnects so unacknowledged reliable frames can be replayed.
 type Handler struct {
-	cfg      config.Config
-	provider provider.Provider
-	sem      chan struct{}
+	cfg        config.Config
+	provider   provider.Provider
+	sem        chan struct{}
+	executorID int64
 
-	mu          sync.Mutex
-	send        Sender
-	attached    bool
-	retryCancel context.CancelFunc
-	turns       map[turnKey]*turn
-	byTurn      map[int64]*turn
-	draining    bool
-	computing   map[int64]bool
-	outbox      map[deliveryKey]any
+	mu               sync.Mutex
+	send             Sender
+	attached         bool
+	retryCancel      context.CancelFunc
+	turns            map[turnKey]*turn
+	byTurn           map[int64]*turn
+	draining         bool
+	computing        map[int64]bool
+	outbox           map[deliveryKey]json.RawMessage
+	outboxStore      *deliveryOutbox
+	answerReceipts   *answerReceiptStore
+	attachmentPolicy attachmentPolicy
 }
 
 // New builds a conversation handler for the configured provider. A non-nil
 // sender immediately attaches the handler, which is the normal shape in tests
 // and in embedders; the runtime itself reattaches on every reconnect.
 func New(cfg config.Config, send Sender, engine provider.Provider) *Handler {
+	executorID, _ := strconv.ParseInt(cfg.ExecutorID, 10, 64)
+	outboxStore := newDeliveryOutbox(cfg.WorkspaceRoot)
+	persisted, err := outboxStore.Load()
+	if err != nil {
+		slog.Warn("load conversation outbox failed", "error", err)
+		persisted = map[deliveryKey]json.RawMessage{}
+	}
 	h := &Handler{
-		cfg:       cfg,
-		provider:  engine,
-		sem:       make(chan struct{}, cfg.MaxConcurrent),
-		turns:     map[turnKey]*turn{},
-		byTurn:    map[int64]*turn{},
-		computing: map[int64]bool{},
-		outbox:    map[deliveryKey]any{},
+		cfg:              cfg,
+		provider:         engine,
+		sem:              make(chan struct{}, cfg.MaxConcurrent),
+		executorID:       executorID,
+		turns:            map[turnKey]*turn{},
+		byTurn:           map[int64]*turn{},
+		computing:        map[int64]bool{},
+		outbox:           persisted,
+		outboxStore:      outboxStore,
+		answerReceipts:   newAnswerReceiptStore(cfg.WorkspaceRoot),
+		attachmentPolicy: newAttachmentPolicy(cfg.BaseURL(), cfg.AttachmentAllowedHosts),
 	}
 	if send != nil {
 		h.Attach(send)
@@ -135,9 +152,16 @@ func (h *Handler) replay() {
 		h.mu.Unlock()
 		return
 	}
-	frames := make([]any, 0, len(h.outbox))
-	for _, frame := range h.outbox {
-		frames = append(frames, frame)
+	keys := make([]deliveryKey, 0, len(h.outbox))
+	for key := range h.outbox {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		return deliveryKeyBefore(keys[i], keys[j])
+	})
+	frames := make([]json.RawMessage, 0, len(keys))
+	for _, key := range keys {
+		frames = append(frames, h.outbox[key])
 	}
 	h.mu.Unlock()
 	for _, frame := range frames {
@@ -215,6 +239,7 @@ func (h *Handler) start(parent context.Context, frame protocol.ConversationTurn)
 		}
 		if outKey.attempt > 0 && frame.DispatchAttempt > 0 && outKey.attempt < frame.DispatchAttempt {
 			delete(h.outbox, outKey)
+			_ = h.outboxStore.Delete(outKey)
 			continue
 		}
 		if outKey.seq == 0 && outKey.attempt >= frame.DispatchAttempt {
@@ -274,12 +299,39 @@ func (h *Handler) cancel(conversationID, turnID int64, attempt int) {
 }
 
 func (h *Handler) resolveElicitation(frame protocol.ConversationElicitation) {
+	existingReceived := false
+	if frame.AnswerID != "" {
+		receipt, err := h.answerReceipts.Get(frame)
+		if err != nil {
+			slog.Warn("read conversation answer receipt failed", "answerId", frame.AnswerID, "error", err)
+			h.ackAnswerFrame(frame, "UNAVAILABLE")
+			return
+		}
+		if receipt != nil && receipt.Status != "RECEIVED" {
+			h.ackAnswerFrame(frame, receipt.Status)
+			return
+		}
+		if receipt != nil {
+			existingReceived = true
+		} else {
+			if err := h.answerReceipts.Save(frame, "RECEIVED"); err != nil {
+				slog.Warn("persist conversation answer receipt failed", "answerId", frame.AnswerID, "error", err)
+				h.ackAnswerFrame(frame, "UNAVAILABLE")
+				return
+			}
+		}
+	}
 	h.mu.Lock()
 	t := h.byTurn[frame.TurnID]
 	h.mu.Unlock()
 	if t == nil {
+		if existingReceived {
+			h.ackAnswerFrame(frame, "RECEIVED")
+			return
+		}
 		// The turn may already be terminal. Durable delivery still requires a
 		// stage so the server can stop resending the answer.
+		_ = h.answerReceipts.Save(frame, "UNAVAILABLE")
 		h.ackAnswerFrame(frame, "UNAVAILABLE")
 		return
 	}
@@ -300,13 +352,19 @@ func (h *Handler) ackAnswerFrame(frame protocol.ConversationElicitation, stage s
 }
 
 func (h *Handler) commandsProbe(frame protocol.ConversationCommandsProbe) {
-	if source, ok := h.provider.(interface{ Commands() []map[string]any }); ok {
-		if commands := source.Commands(); len(commands) > 0 {
+	if h.executorID > 0 && frame.ExecutorID > 0 && frame.ExecutorID != h.executorID {
+		return
+	}
+	if source, ok := h.provider.(interface {
+		CommandsFor(int64) []map[string]any
+	}); ok {
+		if commands := source.CommandsFor(frame.ConversationID); len(commands) > 0 {
 			raw, err := json.Marshal(map[string]any{"availableCommands": commands})
 			if err == nil {
 				_ = h.sendFrame(protocol.ConversationCommandsResult{
-					Type: "CONVERSATION_COMMANDS_RESULT", ConversationID: frame.ConversationID,
-					Status: "OK", Commands: string(raw),
+					Type: "CONVERSATION_COMMANDS_RESULT", ExecutorID: h.executorID,
+					ConversationID: frame.ConversationID,
+					Status:         "OK", Commands: string(raw),
 				})
 				return
 			}
@@ -314,8 +372,9 @@ func (h *Handler) commandsProbe(frame protocol.ConversationCommandsProbe) {
 	}
 	// Codex/Pi/Claude do not expose a stable slash-command catalog.
 	_ = h.sendFrame(protocol.ConversationCommandsResult{
-		Type: "CONVERSATION_COMMANDS_RESULT", ConversationID: frame.ConversationID,
-		Status: "UNSUPPORTED", Error: "runtime does not expose a slash-command catalog",
+		Type: "CONVERSATION_COMMANDS_RESULT", ExecutorID: h.executorID,
+		ConversationID: frame.ConversationID,
+		Status:         "UNSUPPORTED", Error: "runtime does not expose a slash-command catalog",
 	})
 }
 
@@ -332,6 +391,10 @@ func (h *Handler) ackDelivery(frame protocol.ConversationDeliveryAck) {
 	h.mu.Lock()
 	delete(h.outbox, key)
 	h.mu.Unlock()
+	if err := h.outboxStore.Delete(key); err != nil {
+		slog.Warn("delete conversation outbox frame failed", "conversationId", key.conversationID,
+			"turnId", key.turnID, "eventSeq", key.seq, "error", err)
+	}
 }
 
 // Inventory returns running and actively computing turn IDs. Both slices are
@@ -355,6 +418,18 @@ func (h *Handler) Busy() bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return len(h.turns) > 0
+}
+
+// ConversationActive reports whether any turn for the conversation is live.
+func (h *Handler) ConversationActive(conversationID int64) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for key := range h.turns {
+		if key.conversationID == conversationID {
+			return true
+		}
+	}
+	return false
 }
 
 // SetDraining stops accepting new turns during a WHEN_IDLE restart.
@@ -412,8 +487,17 @@ func (h *Handler) sendFrame(value any) error {
 // sends immediately. Non-reliable frames are fire-and-forget.
 func (h *Handler) deliver(value any, key deliveryKey, reliable bool) {
 	if reliable {
+		raw, err := json.Marshal(value)
+		if err != nil {
+			slog.Error("persist conversation outbox frame", "error", err)
+			return
+		}
+		if err := h.outboxStore.Put(key, value); err != nil {
+			slog.Error("persist conversation outbox frame", "error", err)
+			return
+		}
 		h.mu.Lock()
-		h.outbox[key] = value
+		h.outbox[key] = json.RawMessage(raw)
 		h.pruneOutboxLocked()
 		h.mu.Unlock()
 	}
@@ -426,11 +510,34 @@ func (h *Handler) pruneOutboxLocked() {
 		var oldest deliveryKey
 		first := true
 		for key := range h.outbox {
-			if first || key.seq < oldest.seq || (key.seq == oldest.seq && key.turnID < oldest.turnID) {
+			if first || deliveryKeyBefore(key, oldest) {
 				oldest = key
 				first = false
 			}
 		}
 		delete(h.outbox, oldest)
+		_ = h.outboxStore.Delete(oldest)
 	}
+}
+
+func deliveryKeyBefore(left, right deliveryKey) bool {
+	if left.attempt != right.attempt {
+		return left.attempt < right.attempt
+	}
+	if left.turnID != right.turnID {
+		return left.turnID < right.turnID
+	}
+	if left.seq == 0 || right.seq == 0 {
+		if left.seq == 0 && right.seq == 0 {
+			return left.chunk < right.chunk
+		}
+		return right.seq == 0
+	}
+	if left.seq != right.seq {
+		return left.seq < right.seq
+	}
+	if left.chunk != right.chunk {
+		return left.chunk < right.chunk
+	}
+	return left.conversationID < right.conversationID
 }

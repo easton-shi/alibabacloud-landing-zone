@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strconv"
 	"time"
 
@@ -75,13 +76,19 @@ func (t *turn) requestInput(ctx context.Context, input provider.InputRequest) (p
 		t.emit("acp_elicitation_resolved", map[string]any{
 			"type": "acp_elicitation_resolved", "data": resolved,
 		})
-		// The answer is now in the provider's hands. WRITTEN is the terminal
-		// durable-delivery stage the server records.
-		t.markAnswerStage(reply, "WRITTEN")
 		if action == "cancel" {
 			return provider.InputAnswer{}, errTurnCanceled
 		}
-		return provider.InputAnswer{Action: action, Content: reply.Content}, nil
+		return provider.InputAnswer{
+			Action: action, Content: reply.Content,
+			Written: func(err error) {
+				stage := "WRITTEN"
+				if err != nil {
+					stage = "UNKNOWN"
+				}
+				t.markAnswerStage(reply, stage)
+			},
+		}, nil
 	case <-timer.C:
 		t.emit("acp_elicitation_resolved", map[string]any{
 			"type": "acp_elicitation_resolved",
@@ -115,17 +122,10 @@ func (t *turn) unregisterElicitation(requestID string) {
 func (t *turn) resolveElicitation(frame protocol.ConversationElicitation) {
 	t.mu.Lock()
 	request := t.pending[frame.RequestID]
-	if frame.AnswerID != "" {
-		if stage, seen := t.answerStages[frame.AnswerID]; seen {
-			t.mu.Unlock()
-			t.ackAnswer(frame, stage)
-			return
-		}
-		t.answerStages[frame.AnswerID] = "RECEIVED"
-	}
 	t.mu.Unlock()
 
 	if request == nil {
+		t.h.answerReceipts.Save(frame, "UNAVAILABLE")
 		t.ackAnswer(frame, "UNAVAILABLE")
 		return
 	}
@@ -141,10 +141,12 @@ func (t *turn) markAnswerStage(frame protocol.ConversationElicitation, stage str
 	if frame.AnswerID == "" {
 		return
 	}
-	t.mu.Lock()
-	t.answerStages[frame.AnswerID] = stage
-	t.mu.Unlock()
-	t.ackAnswer(frame, stage)
+	ackStage := stage
+	if err := t.h.answerReceipts.Save(frame, stage); err != nil {
+		slog.Warn("persist conversation answer stage failed", "answerId", frame.AnswerID, "error", err)
+		ackStage = "UNKNOWN"
+	}
+	t.ackAnswer(frame, ackStage)
 }
 
 func (t *turn) ackAnswer(frame protocol.ConversationElicitation, stage string) {

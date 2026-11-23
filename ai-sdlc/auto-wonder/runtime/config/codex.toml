@@ -1,0 +1,17 @@
+model = "deepseek-v4.1-flash"
+model_provider = "litellm"
+forced_login_method = "api"
+web_search = "disabled"
+check_for_update_on_startup = false
+approval_policy = "never"
+sandbox_mode = "danger-full-access"
+
+[model_providers.litellm]
+name = "LiteLLM"
+base_url = "https://litellm.yamibuy.net/v1"
+wire_api = "responses"
+env_key = "LITELLM_API_KEY"
+
+[features]
+plugin_hooks = false
+memories = false

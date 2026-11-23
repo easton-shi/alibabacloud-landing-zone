@@ -5,15 +5,27 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 )
 
 // Claude preserves the original Claude Code headless behaviour so the runtime
 // stays drop-in compatible with the community executor.
-type Claude struct{}
+type Claude struct {
+	registry activeTurnRegistry
+}
 
 func (c *Claude) Name() string { return "claude" }
 
+func (c *Claude) Steer(ctx context.Context, dispatchID int64, content string) error {
+	return c.registry.steer(ctx, dispatchID, content)
+}
+
 func (c *Claude) Run(ctx context.Context, req Request, emit func(Event)) (Result, error) {
+	return runSteerable(ctx, req, emit, &c.registry, c.runOnce)
+}
+
+func (c *Claude) runOnce(ctx context.Context, req Request, prompt string, emit func(Event), onStart func(error)) (Result, error) {
+	req.Prompt = prompt
 	args := buildClaudeArgs(req)
 
 	var summary strings.Builder
@@ -21,7 +33,16 @@ func (c *Claude) Run(ctx context.Context, req Request, emit func(Event)) (Result
 	var resultText string
 	var resultErr string
 	isError := false
-	stream := streamCommand(ctx, agentCommand(req.AgentPath, "claude"), args, req.WorkDir, envSlice(currentEnv(), req.Env), func(line string) {
+	var startOnce sync.Once
+	start := func(err error) {
+		startOnce.Do(func() { onStart(err) })
+	}
+	env, err := MergeEnvironment(currentEnv(), req.Env)
+	if err != nil {
+		start(err)
+		return Result{}, fmt.Errorf("claude environment: %w", err)
+	}
+	stream := streamCommandWithStart(ctx, agentCommand(req.AgentPath, "claude"), args, req.WorkDir, env, func(line string) {
 		emit(Event{Kind: "stdout", Text: truncate(line, 2000)})
 		trimmed := strings.TrimSpace(line)
 		if !strings.HasPrefix(trimmed, "{") {
@@ -34,6 +55,7 @@ func (c *Claude) Run(ctx context.Context, req Request, emit func(Event)) (Result
 		if id, ok := event["session_id"].(string); ok && sessionID == "" {
 			sessionID = id
 			emit(Event{Kind: "session", SessionID: id})
+			start(nil)
 		}
 		if event["type"] == "assistant" {
 			if text := claudeAssistantText(event); text != "" {
@@ -60,6 +82,14 @@ func (c *Claude) Run(ctx context.Context, req Request, emit func(Event)) (Result
 		}
 	}, func(line string) {
 		emit(Event{Kind: "stderr", Text: truncate(line, 2000)})
+	}, func(err error) {
+		if err != nil {
+			start(err)
+			return
+		}
+		if req.SessionID != "" {
+			start(nil)
+		}
 	})
 	if stream.err != nil && stream.exitCode != 0 {
 		message := stream.stderr

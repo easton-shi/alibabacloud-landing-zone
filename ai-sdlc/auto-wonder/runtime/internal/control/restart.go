@@ -120,6 +120,10 @@ func (h *Handler) Handle(ctx context.Context, raw []byte) bool {
 		if frame.ExecutorID != 0 && frame.ExecutorID != h.ExecutorID {
 			return true
 		}
+		if err := validateUpgradeFrame(frame); err != nil {
+			h.reportUpgrade(frame.RequestID, "failed", "", true, h.Version, err.Error())
+			return true
+		}
 		h.handleUpgrade(ctx, frame)
 		return true
 	case "EXECUTOR_UPGRADE_RESULT_ACK", "EXECUTOR_UPGRADE_RESULT_SUPPORT":

@@ -16,38 +16,61 @@ import (
 // Both shapes are supported through Request.PermissionFlag / PromptFlag.
 type OpenCode struct {
 	mu       sync.Mutex
-	commands []map[string]any
+	commands map[int64][]map[string]any
+	registry activeTurnRegistry
 }
 
 func (o *OpenCode) Name() string { return "opencode" }
 
-// Commands returns the most recent ACP slash-command catalog.
-func (o *OpenCode) Commands() []map[string]any {
+func (o *OpenCode) Steer(ctx context.Context, dispatchID int64, content string) error {
+	return o.registry.steer(ctx, dispatchID, content)
+}
+
+// CommandsFor returns the ACP slash-command catalog for one conversation.
+func (o *OpenCode) CommandsFor(conversationID int64) []map[string]any {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	return append([]map[string]any(nil), o.commands...)
+	return append([]map[string]any(nil), o.commands[conversationID]...)
 }
 
 func (o *OpenCode) Run(ctx context.Context, req Request, emit func(Event)) (Result, error) {
+	return runSteerable(ctx, req, emit, &o.registry, o.runOnce)
+}
+
+func (o *OpenCode) runOnce(ctx context.Context, req Request, prompt string, emit func(Event), onStart func(error)) (Result, error) {
+	req.Prompt = prompt
 	if req.UseACP {
-		return o.runACP(ctx, req, emit)
+		return o.runACP(ctx, req, emit, onStart)
 	}
 	args := buildOpenCodeArgs(req)
 
-	env := envSlice(currentEnv(), req.Env)
+	env, err := MergeEnvironment(currentEnv(), req.Env)
+	if err != nil {
+		onStart(err)
+		return Result{}, fmt.Errorf("opencode environment: %w", err)
+	}
 	if content := openCodeConfigContent(req.MCPConfigPath); content != "" {
-		env = envSlice(env, map[string]string{"OPENCODE_CONFIG_CONTENT": content})
+		env, err = MergeEnvironment(env, map[string]string{"OPENCODE_CONFIG_CONTENT": content})
+		if err != nil {
+			onStart(err)
+			return Result{}, fmt.Errorf("opencode MCP environment: %w", err)
+		}
 	}
 
 	var summary strings.Builder
 	var sessionID string
 	var engineErr string
-	stream := streamCommand(ctx, agentCommand(req.AgentPath, "opencode"), args, req.WorkDir, env, func(line string) {
+	var startOnce sync.Once
+	start := func(err error) {
+		startOnce.Do(func() { onStart(err) })
+	}
+	stream := streamCommandWithStart(ctx, agentCommand(req.AgentPath, "opencode"), args, req.WorkDir, env, func(line string) {
 		emit(Event{Kind: "stdout", Text: truncate(line, 2000)})
 		kind, text, session, _ := parseOpenCodeEvent(line)
 		if session != "" && sessionID == "" {
 			sessionID = session
 			emit(Event{Kind: "session", SessionID: session})
+			start(nil)
 		}
 		switch kind {
 		case "text":
@@ -63,6 +86,14 @@ func (o *OpenCode) Run(ctx context.Context, req Request, emit func(Event)) (Resu
 		}
 	}, func(line string) {
 		emit(Event{Kind: "stderr", Text: truncate(line, 2000)})
+	}, func(err error) {
+		if err != nil {
+			start(err)
+			return
+		}
+		if req.SessionID != "" {
+			start(nil)
+		}
 	})
 	if stream.err != nil && stream.exitCode != 0 {
 		message := stream.stderr

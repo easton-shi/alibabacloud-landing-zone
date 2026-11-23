@@ -24,6 +24,7 @@ source e2e-tests/lib/common.sh
 
 aw_e2e_init_runtime
 aw_e2e_prepare_state_dir
+aw_e2e_prepare_minio_license
 
 log "project=$AW_E2E_PROJECT network=$AW_E2E_NETWORK state=$AW_E2E_STATE_DIR"
 

@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -89,6 +90,13 @@ func New(cfg Config, currentVersion, executable, receiptPath string) *Updater {
 // PlatformKey returns the artifact key used by manifests, for example
 // darwin-arm64 or linux-amd64.
 func PlatformKey() string { return runtime.GOOS + "-" + runtime.GOARCH }
+
+// SupportsSelfUpdate reports whether this host has a release source and can
+// safely replace the running executable in place.
+func (u *Updater) SupportsSelfUpdate() bool {
+	return u != nil && strings.TrimSpace(u.BaseURL) != "" && runtime.GOOS != "windows" &&
+		(u.Insecure || strings.TrimSpace(u.PublicKey) != "")
+}
 
 // LatestVersion resolves the version advertised under /latest.
 func (u *Updater) LatestVersion(ctx context.Context) (string, error) {
@@ -169,6 +177,54 @@ func (u *Updater) Download(ctx context.Context, version string) (string, error) 
 	}
 	cleanup = false
 	return path, nil
+}
+
+// VerifyCandidate runs the downloaded executable's version command before it
+// replaces the active binary.
+func (u *Updater) VerifyCandidate(path, expectedVersion string) error {
+	if path == "" || expectedVersion == "" {
+		return fmt.Errorf("candidate path and expected version are required")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	output, err := exec.CommandContext(ctx, path, "--version").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("candidate self-check: %w: %s", err, strings.TrimSpace(string(output)))
+	}
+	for _, field := range strings.Fields(string(output)) {
+		if CompareVersions(field, expectedVersion) == 0 {
+			return nil
+		}
+	}
+	return fmt.Errorf("candidate self-check version mismatch: got %q want %q",
+		strings.TrimSpace(string(output)), expectedVersion)
+}
+
+// RecoverPending rolls back a replacement if the new process started with a
+// version older than the requested target.
+func (u *Updater) RecoverPending() (bool, error) {
+	receipt, err := u.ReadReceipt()
+	if err != nil || receipt == nil || receipt.Phase != "restarting" {
+		return false, err
+	}
+	if receipt.CreatedAt.IsZero() || time.Since(receipt.CreatedAt) > 24*time.Hour {
+		return false, u.ClearReceipt()
+	}
+	if VersionAtLeast(u.CurrentVersion, receipt.TargetVersion) {
+		return false, nil
+	}
+	if err := u.Rollback(); err != nil {
+		receipt.Phase = "rollback_failed"
+		receipt.Error = err.Error()
+		_ = u.WriteReceipt(*receipt)
+		return false, fmt.Errorf("rollback pending update: %w", err)
+	}
+	receipt.Phase = "rolled_back"
+	receipt.Error = fmt.Sprintf("started version %s, expected %s", u.CurrentVersion, receipt.TargetVersion)
+	if err := u.WriteReceipt(*receipt); err != nil {
+		return true, err
+	}
+	return true, nil
 }
 
 // Replace installs newPath over the running executable and keeps a backup for

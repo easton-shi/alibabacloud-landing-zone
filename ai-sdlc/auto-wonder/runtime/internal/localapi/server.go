@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aliyun/alibabacloud-landing-zone/ai-sdlc/auto-wonder/runtime/internal/memory"
@@ -34,9 +35,55 @@ type MemoryEndpoints struct {
 	Release  string
 }
 
+// CompletionTracker captures the last accepted completion_requested event.
+type CompletionTracker struct {
+	mu   sync.Mutex
+	refs []string
+	done bool
+}
+
+func NewCompletionTracker() *CompletionTracker { return &CompletionTracker{} }
+
+func (t *CompletionTracker) Record(refs []string) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	t.refs = append([]string(nil), refs...)
+	t.done = true
+	t.mu.Unlock()
+}
+
+func (t *CompletionTracker) Refs() []string {
+	if t == nil {
+		return nil
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return append([]string(nil), t.refs...)
+}
+
+func (t *CompletionTracker) Completed() bool {
+	if t == nil {
+		return false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.done
+}
+
+// StepEventEndpoints wires the loopback step-event relay.
+type StepEventEndpoints struct {
+	Client           *requests.Client
+	Tracker          *CompletionTracker
+	StepID           string
+	StepAttempt      int
+	AllowLocalAccept bool
+}
+
 // Start binds 127.0.0.1 on a random port and serves the Agent-facing loopback API.
 func Start(dispatchID int64, stepID string, stepAttempt int, client *requests.Client,
-	memoryEndpoints MemoryEndpoints) (*Server, error) {
+	memoryEndpoints MemoryEndpoints, stepEventConfig ...StepEventEndpoints) (*Server, error) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return nil, fmt.Errorf("listen local API: %w", err)
@@ -72,6 +119,9 @@ func Start(dispatchID int64, stepID string, stepAttempt int, client *requests.Cl
 		_ = json.NewEncoder(w).Encode(answer)
 	})
 	registerMemoryRoutes(mux, memoryEndpoints)
+	if len(stepEventConfig) > 0 {
+		registerStepEventRoutes(mux, dispatchID, stepEventConfig[0])
+	}
 	server.http = &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	go func() { _ = server.http.Serve(listener) }()
 	return server, nil
@@ -85,6 +135,51 @@ func (s *Server) Close() {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	_ = s.http.Shutdown(ctx)
+}
+
+type stepEventRequest struct {
+	Type         string   `json:"type"`
+	StepID       string   `json:"stepId"`
+	StepAttempt  int      `json:"stepAttempt"`
+	EvidenceRefs []string `json:"evidenceRefs"`
+}
+
+func registerStepEventRoutes(mux *http.ServeMux, dispatchID int64, endpoints StepEventEndpoints) {
+	if endpoints.Client == nil {
+		return
+	}
+	path := fmt.Sprintf("/dispatches/%d/step-events", dispatchID)
+	mux.HandleFunc(path, func(w http.ResponseWriter, r *http.Request) {
+		if !requireLoopback(w, r) || !requireMethod(w, r, http.MethodPost) {
+			return
+		}
+		body, err := readBody(w, r)
+		if err != nil {
+			return
+		}
+		var event stepEventRequest
+		if err := json.Unmarshal(body, &event); err != nil {
+			http.Error(w, "invalid JSON body", http.StatusBadRequest)
+			return
+		}
+		raw, status, upstreamErr := endpoints.Client.StepEvent(r.Context(), body)
+		accepted := status/100 == 2
+		if !accepted && endpoints.AllowLocalAccept &&
+			(status == http.StatusNotFound || status == http.StatusMethodNotAllowed) {
+			accepted = true
+			status = http.StatusAccepted
+			raw = []byte(`{"accepted":true}`)
+			upstreamErr = nil
+		}
+		if accepted && event.Type == "completion_requested" && endpoints.Tracker != nil {
+			stepMatches := event.StepID == "" || endpoints.StepID == "" || event.StepID == endpoints.StepID
+			attemptMatches := event.StepAttempt == 0 || event.StepAttempt == endpoints.StepAttempt
+			if stepMatches && attemptMatches {
+				endpoints.Tracker.Record(event.EvidenceRefs)
+			}
+		}
+		writeUpstream(w, raw, status, upstreamErr)
+	})
 }
 
 func registerMemoryRoutes(mux *http.ServeMux, endpoints MemoryEndpoints) {

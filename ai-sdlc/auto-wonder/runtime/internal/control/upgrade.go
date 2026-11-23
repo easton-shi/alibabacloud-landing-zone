@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"regexp"
+	"strings"
 	"time"
 
 	"github.com/aliyun/alibabacloud-landing-zone/ai-sdlc/auto-wonder/runtime/internal/update"
@@ -37,6 +39,27 @@ type UpgradeResult struct {
 }
 
 const defaultUpgradeDrainTimeout = 10 * time.Minute
+
+var releaseVersionPattern = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+$`)
+
+func validateUpgradeFrame(frame UpgradeFrame) error {
+	if strings.TrimSpace(frame.RequestID) == "" || len(frame.RequestID) > 80 {
+		return fmt.Errorf("invalid upgrade requestId")
+	}
+	if !releaseVersionPattern.MatchString(frame.TargetVersion) {
+		return fmt.Errorf("unsupported target version %q", frame.TargetVersion)
+	}
+	if frame.IssuedAt != "" {
+		issuedAt, err := time.Parse(time.RFC3339, frame.IssuedAt)
+		if err != nil {
+			return fmt.Errorf("invalid issuedAt: %w", err)
+		}
+		if time.Since(issuedAt) > time.Minute || time.Until(issuedAt) > time.Minute {
+			return fmt.Errorf("upgrade request expired: issuedAt %s", frame.IssuedAt)
+		}
+	}
+	return nil
+}
 
 func (h *Handler) handleUpgrade(ctx context.Context, frame UpgradeFrame) {
 	if h.accept("upgrade:"+frame.RequestID) == false {
@@ -95,6 +118,10 @@ func (h *Handler) upgrade(ctx context.Context, requestID, target string, launch 
 	h.reportUpgrade(requestID, "downloading", "", false, "", "")
 	artifact, err := h.Updater.Download(ctx, target)
 	if err != nil {
+		h.reportUpgrade(requestID, "failed", "", false, h.Version, err.Error())
+		return
+	}
+	if err := h.Updater.VerifyCandidate(artifact, target); err != nil {
 		h.reportUpgrade(requestID, "failed", "", false, h.Version, err.Error())
 		return
 	}
@@ -176,7 +203,22 @@ func (h *Handler) PublishUpgradeReceipt(send func(any) error) {
 		}
 		return
 	}
-	if receipt.Phase != "restarting" || time.Since(receipt.CreatedAt) > 24*time.Hour {
+	if time.Since(receipt.CreatedAt) > 24*time.Hour {
+		_ = h.Updater.ClearReceipt()
+		return
+	}
+	if receipt.Phase == "rolled_back" || receipt.Phase == "rollback_failed" {
+		result := UpgradeResult{
+			Type: "EXECUTOR_UPGRADE_RESULT", ExecutorID: h.ExecutorID, RequestID: receipt.RequestID,
+			Phase: "failed", ReceiptID: receipt.ReceiptID, Terminal: true,
+			CurrentVersion: h.Version, Error: receipt.Error,
+		}
+		if err := send(result); err != nil {
+			slog.Warn("publish rollback receipt failed", "error", err)
+		}
+		return
+	}
+	if receipt.Phase != "restarting" {
 		_ = h.Updater.ClearReceipt()
 		return
 	}

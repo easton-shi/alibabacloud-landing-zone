@@ -166,6 +166,35 @@ func (c *Client) endpoint(suffix string) string {
 	return fmt.Sprintf("%s/api/daemon/dispatches/%d/requests%s", base, c.DispatchID, suffix)
 }
 
+// StepEvent proxies one step event to the daemon endpoint and returns the raw
+// upstream response so the local API can preserve its status and body.
+func (c *Client) StepEvent(ctx context.Context, body []byte) ([]byte, int, error) {
+	if c.BaseURL == "" || c.Token == "" || c.DispatchID == 0 {
+		return nil, 0, fmt.Errorf("step event client is not configured")
+	}
+	endpoint := fmt.Sprintf("%s/api/daemon/dispatches/%d/step-events",
+		strings.TrimRight(c.BaseURL, "/"), c.DispatchID)
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return nil, 0, err
+	}
+	request.Header.Set("Authorization", "Bearer "+c.Token)
+	request.Header.Set("Content-Type", "application/json")
+	response, err := (&http.Client{Timeout: 30 * time.Second}).Do(request)
+	if err != nil {
+		return nil, 0, fmt.Errorf("post step event: %w", err)
+	}
+	defer response.Body.Close()
+	raw, readErr := io.ReadAll(io.LimitReader(response.Body, 256*1024))
+	if readErr != nil {
+		return nil, response.StatusCode, fmt.Errorf("read step event response: %w", readErr)
+	}
+	if response.StatusCode/100 != 2 {
+		return raw, response.StatusCode, fmt.Errorf("step event HTTP %d", response.StatusCode)
+	}
+	return raw, response.StatusCode, nil
+}
+
 func normalize(answer Answer, status string) Answer {
 	answer.Status = status
 	if answer.Action == "" {

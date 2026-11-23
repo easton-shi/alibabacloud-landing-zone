@@ -76,12 +76,19 @@ exporting it before running a script.
 | `AW_E2E_APP_PORT` | `7001` | the service's own port |
 | `AW_E2E_MYSQL_IMAGE` | `mysql:8.0` | |
 | `AW_E2E_REDIS_IMAGE` | `redis:7-alpine` | |
-| `AW_E2E_MINIO_IMAGE` | `quay.io/minio/minio:latest` | |
+| `AW_E2E_MINIO_IMAGE` | `quay.io/minio/aistor/minio:latest` | AIStor image; requires a license |
+| `AW_E2E_MC_IMAGE` | `quay.io/minio/aistor/minio:latest` | MinIO client image; AIStor bundles `mc` |
+| `AW_E2E_MINIO_LICENSE_FILE` | unset | Path to an AIStor license JWT file |
+| `AW_E2E_MINIO_LICENSE` | unset | Raw AIStor license JWT; written to a 0600 file in the state dir |
 | `AW_E2E_OFFICIAL_IMAGE_MIRROR` | `public.ecr.aws/docker/library` | fallback for Docker Official Images |
 | `AW_E2E_BUCKET` | `aw-e2e-autowonder` | object storage bucket |
 | `AW_E2E_JAR` | `target/auto-wonder.jar` | artefact under test |
 | `AW_E2E_SMOKE_STOP` | unset | set to `1` to stop the service when `smoke.sh` ends |
 | `AW_BOOTSTRAP_DOCKER_TIMEOUT` | `180` | seconds to wait for Docker Desktop |
+
+For the default AIStor image, set `AW_E2E_MINIO_LICENSE_FILE` to a downloaded
+license JWT or pass the JWT in `AW_E2E_MINIO_LICENSE`. The E2E scripts mount it
+read-only at `/minio.license`.
 
 ## What is deliberately not modified
 

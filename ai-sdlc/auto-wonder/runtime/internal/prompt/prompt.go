@@ -20,7 +20,12 @@ type BuildWork struct {
 	Checkouts []repos.Checkout
 	// LazyRepos are readable but not checked out; the agent clones them only
 	// when the task actually needs them.
-	LazyRepos []repos.Spec
+	LazyRepos               []repos.Spec
+	LocalAPIEndpoint        string
+	DispatchID              int64
+	StepID                  string
+	StepAttempt             int
+	ArtifactProtocolVersion int
 }
 
 // Build renders the execution context in the same order as the official
@@ -89,6 +94,22 @@ func Build(c *capsule.Capsule, work BuildWork) (string, error) {
 			"Do not place credentials, tokens or environment-variable values in deliverables.",
 		pkg, c.WorkspaceDir, c.WorkspaceDir, c.ArtifactsDir, c.ArtifactsDir,
 		c.ArtifactsDir, c.ArtifactsDir, c.ArtifactsDir))
+
+	if work.LocalAPIEndpoint != "" {
+		attempt := work.StepAttempt
+		if attempt < 1 {
+			attempt = 1
+		}
+		parts = append(parts, fmt.Sprintf(
+			"## Completion protocol\n"+
+				"Before ending ordinary work successfully, POST a completion_requested event to %s/dispatches/%d/step-events "+
+				"and wait for an accepted HTTP 202 response.\n"+
+				"Example body: {\"stepId\":\"%s\",\"stepAttempt\":%d,\"type\":\"completion_requested\","+
+				"\"message\":\"<what you delivered>\",\"evidenceRefs\":[\"evidence/<file>\",\"deliverables/<file>\"]}.\n"+
+				"evidenceRefs must be relative to %s and point to regular files under typed output directories. "+
+				"Do not use full paths or an artifacts/output/ prefix. The Runtime publishes only referenced files.",
+			work.LocalAPIEndpoint, work.DispatchID, work.StepID, attempt, c.ArtifactsDir))
+	}
 
 	return strings.Join(nonEmpty(parts), "\n\n"), nil
 }

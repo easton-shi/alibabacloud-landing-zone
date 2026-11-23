@@ -62,6 +62,9 @@ func TestMaterializeAndWriteRevision(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(checkouts[0].Dir, "README.md"), []byte("two\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	// The clone does not inherit the seed repository's local author identity.
+	mustGit(t, checkouts[0].Dir, "config", "user.email", "runtime@example.test")
+	mustGit(t, checkouts[0].Dir, "config", "user.name", "Runtime Test")
 	mustGit(t, checkouts[0].Dir, "add", "README.md")
 	mustGit(t, checkouts[0].Dir, "commit", "-m", "second")
 	second := strings.TrimSpace(mustGit(t, checkouts[0].Dir, "rev-parse", "HEAD"))
@@ -82,6 +85,29 @@ func TestMaterializeAndWriteRevision(t *testing.T) {
 	afterPush := readRevisions(t, revisionPath)
 	if afterPush[0].RemoteHeadCommit != second {
 		t.Fatalf("revision after push = %+v", afterPush[0])
+	}
+}
+
+func TestWriteRevisionWritesEmptyDocumentWithoutCheckouts(t *testing.T) {
+	ctx := context.Background()
+	revisionPath := filepath.Join(t.TempDir(), "artifacts", "deliverables", "runtime-source-revision.json")
+
+	if err := WriteRevision(ctx, nil, revisionPath); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(revisionPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document revisionDocument
+	if err := json.Unmarshal(raw, &document); err != nil {
+		t.Fatal(err)
+	}
+	if document.SchemaVersion != "autowonder.runtimeSourceRevision.v1" {
+		t.Fatalf("schemaVersion = %q", document.SchemaVersion)
+	}
+	if len(document.Repositories) != 0 {
+		t.Fatalf("repositories = %+v", document.Repositories)
 	}
 }
 

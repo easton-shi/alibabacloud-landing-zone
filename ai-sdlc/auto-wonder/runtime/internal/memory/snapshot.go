@@ -21,7 +21,7 @@ type snapshot struct {
 type store struct {
 	ID        int64      `json:"storeId"`
 	Scope     string     `json:"scope"`
-	OwnerRef  string     `json:"ownerRef"`
+	OwnerRef  json.Number `json:"ownerRef"`
 	Revision  int64      `json:"currentRevision"`
 	Documents []document `json:"documents"`
 }
@@ -78,7 +78,7 @@ func render(value snapshot) string {
 		}
 		header := fmt.Sprintf("### Platform store %d (%s", store.ID, store.Scope)
 		if store.OwnerRef != "" {
-			header += ":" + store.OwnerRef
+			header += ":" + store.OwnerRef.String()
 		}
 		header += fmt.Sprintf(", revision %d)", store.Revision)
 		parts = append(parts, header)

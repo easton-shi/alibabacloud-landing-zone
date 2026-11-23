@@ -40,6 +40,7 @@ type Dispatch struct {
 	AllowNetwork               *bool                       `json:"allowNetwork"`
 	PackageRefreshPath         string                      `json:"packageRefreshPath"`
 	ArtifactUploadPath         string                      `json:"artifactUploadPath"`
+	ArtifactProtocolVersion    int                         `json:"artifactProtocolVersion"`
 	CheckpointUploadPath       string                      `json:"checkpointUploadPath"`
 	CheckpointRefreshPath      string                      `json:"checkpointRefreshPath"`
 	MemorySnapshotPath         string                      `json:"memorySnapshotPath"`
@@ -97,6 +98,49 @@ type PauseFailed struct {
 	Type       string `json:"type"`
 	DispatchID int64  `json:"dispatchId"`
 	Error      string `json:"error"`
+}
+
+// TaskSteer is a terminal human steering request for an active dispatch turn.
+// The runtime cooperatively cancels the active provider turn, waits for it to
+// exit, and resumes the same agent session with Content.
+type TaskSteer struct {
+	Type       string `json:"type"`
+	GuidanceID int64  `json:"guidanceId"`
+	DispatchID int64  `json:"dispatchId"`
+	ExecutorID int64  `json:"executorId,omitempty"`
+	Content    string `json:"content"`
+}
+
+// TaskSteerAck acknowledges a terminal steering request. Status is APPLIED
+// once the steering content has been handed to the provider session, or FAILED
+// when no active turn exists or submission fails.
+type TaskSteerAck struct {
+	Type       string `json:"type"`
+	GuidanceID int64  `json:"guidanceId"`
+	DispatchID int64  `json:"dispatchId"`
+	Status     string `json:"status"`
+	Error      string `json:"error,omitempty"`
+}
+
+// TaskGuidance is a non-terminal guidance batch for a dispatch or conversation.
+type TaskGuidance struct {
+	Type          string `json:"type"`
+	GuidanceID    int64  `json:"guidanceId"`
+	DispatchID    int64  `json:"dispatchId"`
+	WorkitemID    int64  `json:"workitemId,omitempty"`
+	TargetAgentID int64  `json:"targetAgentId,omitempty"`
+	Content       string `json:"content"`
+	Mode          string `json:"mode,omitempty"`
+}
+
+// TaskGuidanceAck acknowledges a non-terminal guidance batch.
+type TaskGuidanceAck struct {
+	Type          string `json:"type"`
+	GuidanceID    int64  `json:"guidanceId"`
+	DispatchID    int64  `json:"dispatchId"`
+	Status        string `json:"status"`
+	Error         string `json:"error,omitempty"`
+	ReplyMarkdown string `json:"replyMarkdown,omitempty"`
 }
 
 // Progress moves a dispatch to RUNNING and feeds the UI timeline.

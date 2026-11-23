@@ -30,6 +30,7 @@ import (
 	"github.com/aliyun/alibabacloud-landing-zone/ai-sdlc/auto-wonder/runtime/internal/repos"
 	"github.com/aliyun/alibabacloud-landing-zone/ai-sdlc/auto-wonder/runtime/internal/requests"
 	"github.com/aliyun/alibabacloud-landing-zone/ai-sdlc/auto-wonder/runtime/internal/upload"
+	"github.com/aliyun/alibabacloud-landing-zone/ai-sdlc/auto-wonder/runtime/internal/workspacegc"
 )
 
 // Sender is the narrow write surface used by the runner.
@@ -43,6 +44,7 @@ type Runner struct {
 	client   Sender
 	provider provider.Provider
 	sem      chan struct{}
+	outbox   *resultOutbox
 
 	mu       sync.Mutex
 	running  map[int64]context.CancelFunc
@@ -51,20 +53,53 @@ type Runner struct {
 	pauses   map[int64]bool
 	stops    map[int64]bool
 	draining bool
+
+	guidanceMu        sync.Mutex
+	guidanceAcks      map[int64]protocol.TaskSteerAck
+	guidanceBatchAcks map[int64]protocol.TaskGuidanceAck
 }
 
 // New builds a runner for the configured provider.
 func New(cfg config.Config, client Sender, engine provider.Provider) *Runner {
 	return &Runner{
-		cfg:      cfg,
-		client:   client,
-		provider: engine,
-		sem:      make(chan struct{}, cfg.MaxConcurrent),
-		running:  map[int64]context.CancelFunc{},
-		cancels:  map[int64]context.CancelFunc{},
-		owned:    map[int64]bool{},
-		pauses:   map[int64]bool{},
-		stops:    map[int64]bool{},
+		cfg:               cfg,
+		client:            client,
+		provider:          engine,
+		sem:               make(chan struct{}, cfg.MaxConcurrent),
+		outbox:            newResultOutbox(cfg.WorkspaceRoot),
+		running:           map[int64]context.CancelFunc{},
+		cancels:           map[int64]context.CancelFunc{},
+		owned:             map[int64]bool{},
+		pauses:            map[int64]bool{},
+		stops:             map[int64]bool{},
+		guidanceAcks:      map[int64]protocol.TaskSteerAck{},
+		guidanceBatchAcks: map[int64]protocol.TaskGuidanceAck{},
+	}
+}
+
+// ReplayOutbox resends dispatch frames that were persisted but not acknowledged.
+func (r *Runner) ReplayOutbox() {
+	frames, err := r.outbox.List()
+	if err != nil {
+		slog.Warn("replay dispatch outbox failed", "error", err)
+		return
+	}
+	for _, frame := range frames {
+		r.send(frame)
+	}
+}
+
+// HandleResultAck removes a persisted terminal frame after durable acceptance.
+func (r *Runner) HandleResultAck(raw []byte) {
+	var ack struct {
+		DispatchID int64 `json:"dispatchId"`
+		Accepted   bool  `json:"accepted"`
+	}
+	if json.Unmarshal(raw, &ack) != nil || ack.DispatchID <= 0 || !ack.Accepted {
+		return
+	}
+	if err := r.outbox.Delete(ack.DispatchID); err != nil {
+		slog.Warn("delete dispatch outbox result failed", "dispatchId", ack.DispatchID, "error", err)
 	}
 }
 
@@ -88,6 +123,13 @@ func (r *Runner) Busy() bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return len(r.running) > 0 || len(r.owned) > 0
+}
+
+// Owns reports whether this executor currently owns the dispatch ID.
+func (r *Runner) Owns(dispatchID int64) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.owned[dispatchID]
 }
 
 // SetDraining stops accepting new dispatches while a WHEN_IDLE restart waits.
@@ -139,6 +181,15 @@ func (r *Runner) Handle(parent context.Context, raw []byte) {
 		if json.Unmarshal(raw, &frame) != nil || frame.DispatchID == 0 {
 			return
 		}
+		if r.outbox.Has(frame.DispatchID) {
+			r.send(protocol.Ack{Type: "TASK_ACK", DispatchID: frame.DispatchID})
+			if pending, err := r.outbox.Get(frame.DispatchID); err == nil {
+				r.send(pending)
+			} else {
+				slog.Warn("read pending dispatch result failed", "dispatchId", frame.DispatchID, "error", err)
+			}
+			return
+		}
 		r.mu.Lock()
 		draining := r.draining
 		r.mu.Unlock()
@@ -162,7 +213,145 @@ func (r *Runner) Handle(parent context.Context, raw []byte) {
 			r.mu.Unlock()
 			r.cancel(frame.DispatchID)
 		}
+	case "TASK_RESULT_ACK":
+		r.HandleResultAck(raw)
+	case "TASK_STEER":
+		var frame protocol.TaskSteer
+		if json.Unmarshal(raw, &frame) == nil {
+			r.handleTaskSteer(parent, frame)
+		}
+	case "TASK_GUIDANCE":
+		var frame protocol.TaskGuidance
+		if json.Unmarshal(raw, &frame) == nil {
+			r.handleTaskGuidance(parent, frame)
+		}
 	}
+}
+
+func (r *Runner) handleTaskSteer(ctx context.Context, frame protocol.TaskSteer) {
+	if frame.DispatchID == 0 || frame.GuidanceID == 0 {
+		return
+	}
+
+	r.guidanceMu.Lock()
+	defer r.guidanceMu.Unlock()
+
+	if ack, ok := r.guidanceAcks[frame.GuidanceID]; ok {
+		r.send(ack)
+		return
+	}
+
+	r.mu.Lock()
+	_, active := r.running[frame.DispatchID]
+	r.mu.Unlock()
+	if !active {
+		ack := protocol.TaskSteerAck{
+			Type:       "TASK_STEER_ACK",
+			GuidanceID: frame.GuidanceID,
+			DispatchID: frame.DispatchID,
+			Status:     "FAILED",
+			Error:      "dispatch is not active",
+		}
+		r.guidanceAcks[frame.GuidanceID] = ack
+		r.send(ack)
+		return
+	}
+	steerable, ok := r.provider.(provider.Steerable)
+	if !ok {
+		ack := protocol.TaskSteerAck{
+			Type:       "TASK_STEER_ACK",
+			GuidanceID: frame.GuidanceID,
+			DispatchID: frame.DispatchID,
+			Status:     "FAILED",
+			Error:      "provider does not support steering",
+		}
+		r.guidanceAcks[frame.GuidanceID] = ack
+		r.send(ack)
+		return
+	}
+	if err := steerable.Steer(ctx, frame.DispatchID, frame.Content); err != nil {
+		ack := protocol.TaskSteerAck{
+			Type:       "TASK_STEER_ACK",
+			GuidanceID: frame.GuidanceID,
+			DispatchID: frame.DispatchID,
+			Status:     "FAILED",
+			Error:      err.Error(),
+		}
+		r.guidanceAcks[frame.GuidanceID] = ack
+		r.send(ack)
+		return
+	}
+	ack := protocol.TaskSteerAck{
+		Type:       "TASK_STEER_ACK",
+		GuidanceID: frame.GuidanceID,
+		DispatchID: frame.DispatchID,
+		Status:     "APPLIED",
+	}
+	r.guidanceAcks[frame.GuidanceID] = ack
+	r.send(ack)
+}
+
+func (r *Runner) handleTaskGuidance(ctx context.Context, frame protocol.TaskGuidance) {
+	if frame.DispatchID == 0 || frame.GuidanceID == 0 {
+		return
+	}
+
+	r.guidanceMu.Lock()
+	defer r.guidanceMu.Unlock()
+
+	if ack, ok := r.guidanceBatchAcks[frame.GuidanceID]; ok {
+		r.send(ack)
+		return
+	}
+
+	r.mu.Lock()
+	_, active := r.running[frame.DispatchID]
+	r.mu.Unlock()
+	if !active {
+		ack := protocol.TaskGuidanceAck{
+			Type:       "TASK_GUIDANCE_ACK",
+			GuidanceID: frame.GuidanceID,
+			DispatchID: frame.DispatchID,
+			Status:     "FAILED",
+			Error:      "dispatch is not active",
+		}
+		r.guidanceBatchAcks[frame.GuidanceID] = ack
+		r.send(ack)
+		return
+	}
+	steerable, ok := r.provider.(provider.Steerable)
+	if !ok {
+		ack := protocol.TaskGuidanceAck{
+			Type:       "TASK_GUIDANCE_ACK",
+			GuidanceID: frame.GuidanceID,
+			DispatchID: frame.DispatchID,
+			Status:     "FAILED",
+			Error:      "provider does not support steering",
+		}
+		r.guidanceBatchAcks[frame.GuidanceID] = ack
+		r.send(ack)
+		return
+	}
+	if err := steerable.Steer(ctx, frame.DispatchID, frame.Content); err != nil {
+		ack := protocol.TaskGuidanceAck{
+			Type:       "TASK_GUIDANCE_ACK",
+			GuidanceID: frame.GuidanceID,
+			DispatchID: frame.DispatchID,
+			Status:     "FAILED",
+			Error:      err.Error(),
+		}
+		r.guidanceBatchAcks[frame.GuidanceID] = ack
+		r.send(ack)
+		return
+	}
+	ack := protocol.TaskGuidanceAck{
+		Type:       "TASK_GUIDANCE_ACK",
+		GuidanceID: frame.GuidanceID,
+		DispatchID: frame.DispatchID,
+		Status:     "APPLIED",
+	}
+	r.guidanceBatchAcks[frame.GuidanceID] = ack
+	r.send(ack)
 }
 
 func (r *Runner) cancel(dispatchID int64) {
@@ -218,6 +407,7 @@ func (r *Runner) execute(parent context.Context, frame protocol.Dispatch) {
 	stopped := r.stops[frame.DispatchID]
 	r.mu.Unlock()
 	if stopped {
+		markTerminal(outcome.box, "CANCELED")
 		slog.Info("dispatch canceled by scheduler", "dispatchId", frame.DispatchID)
 		return
 	}
@@ -225,7 +415,69 @@ func (r *Runner) execute(parent context.Context, frame protocol.Dispatch) {
 		r.pause(ctx, frame, outcome)
 		return
 	}
-	r.send(outcome.result)
+	if outcome.result.Success && frame.CheckpointUploadPath != "" {
+		uploadCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		err := r.uploadCompletionCheckpoint(uploadCtx, frame, &outcome)
+		cancel()
+		if err != nil {
+			outcome.result = failedResult(outcome.result, fmt.Errorf("completion checkpoint: %w", err))
+		}
+	}
+	status := "FAILED"
+	if outcome.result.Success {
+		status = "SUCCESS"
+	}
+	markTerminal(outcome.box, status)
+	r.sendTerminal(outcome.result)
+}
+
+// uploadCompletionCheckpoint pins the successful result identity to a durable
+// checkpoint before TASK_RESULT is sent. The server rejects V2 success results
+// whose completion checkpoint cannot be matched to the same result ID.
+func (r *Runner) uploadCompletionCheckpoint(ctx context.Context, frame protocol.Dispatch, outcome *runOutcome) error {
+	document, err := checkpoint.FromCheckouts(ctx, outcome.checkouts)
+	if err != nil {
+		return err
+	}
+	seq := frame.ResumeCheckpointSeq + 1
+	if seq <= 0 {
+		seq = 1
+	}
+	document.DispatchID = strconv.FormatInt(frame.DispatchID, 10)
+	document.CheckpointSeq = seq
+	archive, digest, err := checkpoint.Archive(document)
+	if err != nil {
+		return err
+	}
+	stepID := ""
+	if frame.SDLCStepID != 0 {
+		stepID = strconv.FormatInt(frame.SDLCStepID, 10)
+	}
+	endpoint := resolvePath(httpBase(r.cfg.ServerWSURL), frame.CheckpointUploadPath)
+	receipt, err := checkpoint.Upload(ctx, endpoint, r.cfg.ExecutorToken, frame.DispatchID, seq,
+		r.provider.Name(), outcome.sessionID, r.runtimeID(), stepID, "COMPLETION",
+		outcome.result.ResultID, archive, digest)
+	if err != nil {
+		return err
+	}
+	if receipt.CheckpointSeq > 0 {
+		seq = receipt.CheckpointSeq
+	}
+	if receipt.SHA256 != "" {
+		digest = receipt.SHA256
+	}
+	outcome.result.CheckpointSeq = seq
+	outcome.result.CheckpointSHA256 = digest
+	return nil
+}
+
+func markTerminal(box *capsule.Capsule, status string) {
+	if box == nil {
+		return
+	}
+	if err := workspacegc.WriteTerminal(box.Root, status, time.Now()); err != nil {
+		slog.Warn("write workspace terminal state failed", "root", box.Root, "error", err)
+	}
 }
 
 type runOutcome struct {
@@ -284,6 +536,9 @@ func (r *Runner) runCore(ctx context.Context, frame protocol.Dispatch, recorder 
 		DispatchID:            frame.DispatchID,
 		ResultProtocolVersion: 2,
 		ResultID:              newResultID(),
+	}
+	if err := provider.ValidateTaskEnvironment(frame.EnvironmentVariables); err != nil {
+		return runOutcome{result: failedResult(result, fmt.Errorf("environment variables: %w", err))}
 	}
 
 	progress.emit("capsule.downloading")
@@ -387,22 +642,6 @@ func (r *Runner) runCore(ctx context.Context, frame protocol.Dispatch, recorder 
 		progress.emit(fmt.Sprintf("checkpoint.restored repositories=%d", len(heads)))
 	}
 
-	agentPrompt, err := prompt.Build(box, prompt.BuildWork{Checkouts: checkouts, LazyRepos: lazySpecs})
-	if err != nil {
-		return runOutcome{result: failedResult(result, fmt.Errorf("prompt: %w", err)), box: box,
-			checkouts: checkouts, hooks: hookSet, hookContext: hookContext}
-	}
-	if frame.ResumeSessionID != "" {
-		agentPrompt += "\n\n## Resume context\nContinue session " + frame.ResumeSessionID + " from the previous attempt."
-	}
-
-	mcpPath, err := mcpconfig.Write(box.PackageDir, httpBase(r.cfg.ServerWSURL),
-		frame.DispatchMCPToken, frame.MCPSecrets, filepath.Join(box.Root, "mcp.config.json"))
-	if err != nil {
-		return runOutcome{result: failedResult(result, fmt.Errorf("mcp config: %w", err)), box: box,
-			checkouts: checkouts, hooks: hookSet, hookContext: hookContext}
-	}
-
 	agentEnv := copyEnvironment(frame.EnvironmentVariables)
 	requestClient := &requests.Client{BaseURL: httpBase(r.cfg.ServerWSURL), Token: r.cfg.ExecutorToken,
 		DispatchID: frame.DispatchID}
@@ -418,9 +657,18 @@ func (r *Runner) runCore(ctx context.Context, frame protocol.Dispatch, recorder 
 			Release:  memorystore.MaintenanceEndpoint(frame.MemorySnapshotPath, "releases"),
 		}
 	}
+	completionTracker := localapi.NewCompletionTracker()
 	local, localErr := localapi.Start(frame.DispatchID, strconv.FormatInt(frame.SDLCStepID, 10),
-		max(frame.Attempt, 1), requestClient, memoryEndpoints)
+		max(frame.Attempt, 1), requestClient, memoryEndpoints, localapi.StepEventEndpoints{
+			Client: requestClient, Tracker: completionTracker,
+			StepID: strconv.FormatInt(frame.SDLCStepID, 10), StepAttempt: max(frame.Attempt, 1),
+			AllowLocalAccept: frame.ArtifactProtocolVersion < 2,
+		})
 	if localErr != nil {
+		if frame.ArtifactProtocolVersion >= 2 {
+			return runOutcome{result: failedResult(result, fmt.Errorf("local step-event API: %w", localErr)),
+				box: box, checkouts: checkouts, hooks: hookSet, hookContext: hookContext}
+		}
 		slog.Warn("local request API unavailable", "dispatchId", frame.DispatchID, "error", localErr)
 	} else {
 		defer local.Close()
@@ -439,6 +687,27 @@ func (r *Runner) runCore(ctx context.Context, frame protocol.Dispatch, recorder 
 			agentEnv["AUTOWONDER_MEMORY_MODE"] = "platform"
 		}
 	}
+
+	agentPrompt, err := prompt.Build(box, prompt.BuildWork{
+		Checkouts: checkouts, LazyRepos: lazySpecs, LocalAPIEndpoint: agentEnv["AUTOWONDER_LOCAL_API_ENDPOINT"],
+		DispatchID: frame.DispatchID, StepID: strconv.FormatInt(frame.SDLCStepID, 10),
+		StepAttempt: max(frame.Attempt, 1), ArtifactProtocolVersion: frame.ArtifactProtocolVersion,
+	})
+	if err != nil {
+		return runOutcome{result: failedResult(result, fmt.Errorf("prompt: %w", err)), box: box,
+			checkouts: checkouts, hooks: hookSet, hookContext: hookContext}
+	}
+	if frame.ResumeSessionID != "" {
+		agentPrompt += "\n\n## Resume context\nContinue session " + frame.ResumeSessionID + " from the previous attempt."
+	}
+
+	mcpPath, err := mcpconfig.Write(box.PackageDir, httpBase(r.cfg.ServerWSURL),
+		frame.DispatchMCPToken, frame.MCPSecrets, filepath.Join(box.Root, "mcp.config.json"))
+	if err != nil {
+		return runOutcome{result: failedResult(result, fmt.Errorf("mcp config: %w", err)), box: box,
+			checkouts: checkouts, hooks: hookSet, hookContext: hookContext}
+	}
+
 	requestInput := func(ctx context.Context, input provider.InputRequest) (provider.InputAnswer, error) {
 		context := input.Context
 		if input.Kind == "APPROVAL" {
@@ -520,7 +789,23 @@ func (r *Runner) runCore(ctx context.Context, frame protocol.Dispatch, recorder 
 	}
 	if r.cfg.UploadArtifacts && frame.ArtifactUploadPath != "" {
 		endpoint := resolvePath(httpBase(r.cfg.ServerWSURL), frame.ArtifactUploadPath)
-		if count, err := upload.Artifacts(ctx, endpoint, r.cfg.ExecutorToken, box.ArtifactsDir); err != nil {
+		explicit := completionTracker.Completed()
+		if !explicit && frame.ArtifactProtocolVersion >= 2 {
+			if runErr == nil {
+				runErr = fmt.Errorf("completion intent missing")
+			}
+		} else if explicit {
+			refs := append([]string(nil), completionTracker.Refs()...)
+			refs = append(refs, "deliverables/runtime-source-revision.json")
+			count, err := upload.ArtifactsSelected(ctx, endpoint, r.cfg.ExecutorToken, box.ArtifactsDir, refs)
+			if err != nil {
+				if runErr == nil {
+					runErr = fmt.Errorf("artifact upload: %w", err)
+				}
+			} else if count > 0 {
+				progress.emit(fmt.Sprintf("artifacts.uploaded count=%d mode=explicit", count))
+			}
+		} else if count, err := upload.Artifacts(ctx, endpoint, r.cfg.ExecutorToken, box.ArtifactsDir); err != nil {
 			slog.Warn("artifact upload failed", "dispatchId", frame.DispatchID, "error", err)
 		} else if count > 0 {
 			progress.emit(fmt.Sprintf("artifacts.uploaded count=%d", count))
@@ -607,7 +892,8 @@ func (r *Runner) pause(ctx context.Context, frame protocol.Dispatch, outcome run
 	if receipt.SHA256 != "" {
 		digest = receipt.SHA256
 	}
-	r.send(protocol.Paused{
+	markTerminal(outcome.box, "PAUSED")
+	r.sendTerminal(protocol.Paused{
 		Type: "TASK_PAUSED", DispatchID: frame.DispatchID, CheckpointSeq: seq, CheckpointSHA256: digest,
 	})
 }
@@ -662,6 +948,14 @@ func (r *Runner) send(value any) {
 	if err := r.client.Send(value); err != nil {
 		slog.Error("send frame", "error", err)
 	}
+}
+
+func (r *Runner) sendTerminal(value any) {
+	if err := r.outbox.Put(value); err != nil {
+		slog.Error("persist terminal dispatch frame", "error", err)
+		return
+	}
+	r.send(value)
 }
 
 func failedResult(result protocol.Result, err error) protocol.Result {

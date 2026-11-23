@@ -32,9 +32,15 @@ func buildCodexArgs(unattended bool, reasoningEffort, contextWindow string) []st
 	return append(args, "app-server", "--listen", "stdio://")
 }
 
-type Codex struct{}
+type Codex struct {
+	registry activeTurnRegistry
+}
 
 func (c *Codex) Name() string { return "codex" }
+
+func (c *Codex) Steer(ctx context.Context, dispatchID int64, content string) error {
+	return c.registry.steer(ctx, dispatchID, content)
+}
 
 type rpcMessage struct {
 	ID     *int64          `json:"id,omitempty"`
@@ -62,28 +68,51 @@ type codexClient struct {
 	turnDone  bool
 	summary   strings.Builder
 	threadID  string
+	turnID    string
 }
 
 func (c *Codex) Run(ctx context.Context, req Request, emit func(Event)) (Result, error) {
-	args := append(buildCodexArgs(req.Unattended, req.ReasoningEffort, req.ContextWindow),
-		buildCodexMCPArgs(req.MCPConfigPath)...)
+	return c.runOnce(ctx, req, req.Prompt, emit, func(error) {})
+}
+
+func (c *Codex) runOnce(ctx context.Context, req Request, prompt string, emit func(Event), onStart func(error)) (Result, error) {
+	mcpArgs, mcpEnv, err := buildCodexMCPProjection(req.MCPConfigPath)
+	if err != nil {
+		onStart(err)
+		return Result{}, fmt.Errorf("codex MCP config: %w", err)
+	}
+	args := append(buildCodexArgs(req.Unattended, req.ReasoningEffort, req.ContextWindow), mcpArgs...)
 
 	cmd := exec.CommandContext(ctx, agentCommand(req.AgentPath, "codex"), args...)
 	cmd.Dir = req.WorkDir
-	cmd.Env = envSlice(currentEnv(), req.Env)
+	env, err := MergeEnvironment(currentEnv(), mcpEnv)
+	if err != nil {
+		onStart(err)
+		return Result{}, fmt.Errorf("codex MCP environment: %w", err)
+	}
+	env, err = MergeEnvironment(env, req.Env)
+	if err != nil {
+		onStart(err)
+		return Result{}, fmt.Errorf("codex environment: %w", err)
+	}
+	cmd.Env = env
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
+		onStart(err)
 		return Result{}, fmt.Errorf("codex stdin: %w", err)
 	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
+		onStart(err)
 		return Result{}, fmt.Errorf("codex stdout: %w", err)
 	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
+		onStart(err)
 		return Result{}, fmt.Errorf("codex stderr: %w", err)
 	}
 	if err := cmd.Start(); err != nil {
+		onStart(err)
 		return Result{}, fmt.Errorf("start codex: %w", err)
 	}
 
@@ -94,18 +123,30 @@ func (c *Codex) Run(ctx context.Context, req Request, emit func(Event)) (Result,
 
 	if err := client.initialize(ctx); err != nil {
 		client.stop()
+		onStart(err)
 		return Result{}, err
 	}
 	threadID, err := client.startOrResumeThread(ctx, req)
 	if err != nil {
 		client.stop()
+		onStart(err)
 		return Result{}, err
 	}
 	client.threadID = threadID
-	if err := client.startTurn(ctx, req.Prompt); err != nil {
+	turnID, err := client.startTurn(ctx, prompt)
+	if err != nil {
 		client.stop()
+		onStart(err)
 		return Result{}, err
 	}
+	client.turnID = turnID
+	if req.DispatchID > 0 {
+		unregister := c.registry.register(req.DispatchID, func(steerCtx context.Context, content string) error {
+			return client.steerTurn(steerCtx, content)
+		})
+		defer unregister()
+	}
+	onStart(nil)
 
 	select {
 	case <-client.completed:
@@ -144,22 +185,24 @@ func (c *codexClient) stderrText() string {
 	return strings.TrimSpace(c.stderr.String())
 }
 
-// buildCodexMCPArgs projects mcpServers into `-c` TOML overrides so the user's
-// global ~/.codex/config.toml is never modified.
-func buildCodexMCPArgs(path string) []string {
+// buildCodexMCPProjection projects mcpServers into `-c` TOML overrides. Bearer
+// credentials are passed through named environment variables so they never
+// appear in the child process argv.
+func buildCodexMCPProjection(path string) ([]string, map[string]string, error) {
 	if path == "" {
-		return nil
+		return nil, nil, nil
 	}
 	raw, err := os.ReadFile(path)
 	if err != nil {
-		return nil
+		return nil, nil, err
 	}
 	var source map[string]any
 	if json.Unmarshal(raw, &source) != nil {
-		return nil
+		return nil, nil, fmt.Errorf("parse MCP config")
 	}
 	servers, _ := source["mcpServers"].(map[string]any)
 	var args []string
+	env := map[string]string{}
 	for name, rawEntry := range servers {
 		entry, _ := rawEntry.(map[string]any)
 		if entry == nil {
@@ -171,6 +214,12 @@ func buildCodexMCPArgs(path string) []string {
 			if headers, ok := entry["headers"].(map[string]any); ok {
 				for header, value := range headers {
 					if text, ok := value.(string); ok {
+						if strings.EqualFold(header, "Authorization") && strings.HasPrefix(strings.ToLower(text), "bearer ") {
+							envName := codexMCPBearerEnvName(name)
+							env[envName] = strings.TrimSpace(text[len("Bearer "):])
+							args = append(args, "-c", key+".bearer_token_env_var="+tomlString(envName))
+							continue
+						}
 						args = append(args, "-c", key+".http_headers."+tomlKey(header)+"="+tomlString(text))
 					}
 				}
@@ -190,7 +239,23 @@ func buildCodexMCPArgs(path string) []string {
 			}
 		}
 	}
-	return args
+	return args, env, nil
+}
+
+func codexMCPBearerEnvName(server string) string {
+	var normalized strings.Builder
+	for _, char := range strings.ToUpper(server) {
+		if char == '_' || char >= 'A' && char <= 'Z' || char >= '0' && char <= '9' {
+			normalized.WriteRune(char)
+		} else {
+			normalized.WriteByte('_')
+		}
+	}
+	name := strings.Trim(normalized.String(), "_")
+	if name == "" {
+		name = "SERVER"
+	}
+	return "AUTOWONDER_MCP_TOKEN_" + name
 }
 
 func tomlString(value string) string {
@@ -279,13 +344,18 @@ func (c *codexClient) handleNotification(method string, params json.RawMessage) 
 func (c *codexClient) handleServerRequest(id int64, method string, params json.RawMessage) {
 	lower := strings.ToLower(method)
 	var result any
+	var answered *InputAnswer
 	switch {
 	case strings.Contains(lower, "requestapproval"):
 		answer, ok := c.askHuman("APPROVAL", method, params, "Agent requests approval to continue", nil)
-		if ok && answer.Action == "reject" {
-			result = map[string]any{"decision": "denied"}
-		} else {
+		if ok && (answer.Action == "approve" || answer.Action == "accept") {
 			result = map[string]any{"decision": "approved"}
+			answered = &answer
+		} else {
+			result = map[string]any{"decision": "denied"}
+			if ok {
+				answered = &answer
+			}
 		}
 	case strings.Contains(lower, "elicitation"):
 		answer, ok := c.askHuman("INPUT", method, params, "Agent requests additional input", nil)
@@ -298,6 +368,9 @@ func (c *codexClient) handleServerRequest(id int64, method string, params json.R
 			}
 			result = map[string]any{"action": "accept", "content": content}
 		}
+		if ok {
+			answered = &answer
+		}
 	case strings.Contains(lower, "requestuserinput"):
 		answer, ok := c.askHuman("INPUT", method, params, "Agent requests user input", nil)
 		if ok && answer.Content != nil {
@@ -309,11 +382,23 @@ func (c *codexClient) handleServerRequest(id int64, method string, params json.R
 		} else {
 			result = map[string]any{"answers": []any{}}
 		}
+		if ok {
+			answered = &answer
+		}
 	default:
 		result = map[string]any{}
 	}
 	c.emit(Event{Kind: "tool", Text: "codex server request: " + method})
-	_ = c.write(map[string]any{"jsonrpc": "2.0", "id": id, "result": result})
+	writeErr := c.write(map[string]any{"jsonrpc": "2.0", "id": id, "result": result})
+	if answered != nil {
+		answered.ReportWritten(writeErr)
+	}
+	if writeErr != nil {
+		c.errMu.Lock()
+		c.engineErr = "codex response write failed: " + writeErr.Error()
+		c.errMu.Unlock()
+		c.emit(Event{Kind: "error", Text: "codex response write failed: " + writeErr.Error()})
+	}
 }
 
 func (c *codexClient) askHuman(kind, method string, params json.RawMessage, fallbackMessage string,
@@ -389,12 +474,33 @@ func (c *codexClient) startOrResumeThread(ctx context.Context, req Request) (str
 	return id, nil
 }
 
-func (c *codexClient) startTurn(ctx context.Context, prompt string) error {
-	_, err := c.call(ctx, "turn/start", map[string]any{
+func (c *codexClient) startTurn(ctx context.Context, prompt string) (string, error) {
+	result, err := c.call(ctx, "turn/start", map[string]any{
 		"threadId": c.threadID,
 		"input":    []any{map[string]any{"type": "text", "text": prompt}},
 	})
-	return err
+	if err != nil {
+		return "", err
+	}
+	return turnIDFrom(result), nil
+}
+
+func (c *codexClient) steerTurn(ctx context.Context, content string) error {
+	if c.threadID == "" || c.turnID == "" {
+		return fmt.Errorf("codex turn is not active")
+	}
+	result, err := c.call(ctx, "turn/steer", map[string]any{
+		"threadId":       c.threadID,
+		"expectedTurnId": c.turnID,
+		"input":          []any{map[string]any{"type": "text", "text": content}},
+	})
+	if err != nil {
+		return err
+	}
+	if id := turnIDFrom(result); id != "" {
+		c.turnID = id
+	}
+	return nil
 }
 
 func (c *codexClient) call(ctx context.Context, method string, params any) (json.RawMessage, error) {
@@ -467,6 +573,22 @@ func threadIDFrom(result json.RawMessage) string {
 	} {
 		if text, ok := candidate.(string); ok && text != "" {
 			return text
+		}
+	}
+	return ""
+}
+
+func turnIDFrom(result json.RawMessage) string {
+	var payload map[string]any
+	if json.Unmarshal(result, &payload) != nil {
+		return ""
+	}
+	if id, ok := payload["turnId"].(string); ok && id != "" {
+		return id
+	}
+	if turn, ok := payload["turn"].(map[string]any); ok {
+		if id, ok := turn["id"].(string); ok && id != "" {
+			return id
 		}
 	}
 	return ""

@@ -56,3 +56,35 @@ func TestUploadSendsMultipartFieldsAndToken(t *testing.T) {
 		t.Fatalf("unexpected upload: receipt=%+v seq=%s purpose=%s", receipt, receivedSeq, receivedPurpose)
 	}
 }
+
+func TestBuildLightweightRoundTrip(t *testing.T) {
+	document := Document{
+		DispatchID:    "dispatch-1",
+		CheckpointSeq: 42,
+		StateSha256:   "sha256:abc",
+		Repos: []RepoState{{
+			Name:       "repo",
+			BaseCommit: "base",
+			HeadCommit: "head",
+		}},
+	}
+	archive, digest, err := BuildLightweight(document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if digest == "" {
+		t.Fatal("empty digest")
+	}
+	decoded, err := Decode(archive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decoded.SchemaVersion != LightweightSchemaVersion {
+		t.Fatalf("schema = %q, want %q", decoded.SchemaVersion, LightweightSchemaVersion)
+	}
+	if decoded.DispatchID != document.DispatchID ||
+		decoded.CheckpointSeq != document.CheckpointSeq ||
+		decoded.StateSha256 != document.StateSha256 {
+		t.Fatalf("unexpected decoded document: %+v", decoded)
+	}
+}

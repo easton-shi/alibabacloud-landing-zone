@@ -11,26 +11,37 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Config is the complete runtime configuration.
 type Config struct {
-	ServerWSURL      string
-	ExecutorID       string
-	ExecutorToken    string
-	Provider         string
-	AgentPath        string
-	AgentModel       string
-	ReasoningEffort  string
-	ContextWindow    string
-	WorkspaceRoot    string
-	MaxConcurrent    int
-	HeartbeatSeconds int
-	LogLevel         string
-	Unattended       bool
-	UploadArtifacts  bool
-	MemoryMode       string
-	DaemonName       string
+	ServerWSURL                string
+	ExecutorID                 string
+	ExecutorToken              string
+	Provider                   string
+	AgentPath                  string
+	AgentModel                 string
+	ReasoningEffort            string
+	ContextWindow              string
+	WorkspaceRoot              string
+	MaxConcurrent              int
+	HeartbeatSeconds           int
+	LogLevel                   string
+	Unattended                 bool
+	UploadArtifacts            bool
+	AttachmentAllowedHosts     []string
+	WorkspaceGCEnabled         bool
+	WorkspaceGCInitialDelay    time.Duration
+	WorkspaceGCInterval        time.Duration
+	WorkspaceGCTaskTTL         time.Duration
+	WorkspaceGCConversationTTL time.Duration
+	WorkspaceGCHighWatermark   int
+	WorkspaceGCLowWatermark    int
+	WorkspaceGCMinFreeBytes    int64
+	WorkspaceGCTargetFreeBytes int64
+	MemoryMode                 string
+	DaemonName                 string
 	// RequirePackageSignature rejects unsigned task packages when true.
 	// Default false keeps Community servers that predate signing usable.
 	RequirePackageSignature bool
@@ -56,30 +67,40 @@ var reasoningPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,32}$`)
 
 func load() (Config, error) {
 	cfg := Config{
-		ServerWSURL:             strings.TrimRight(env("AUTOWONDER_SERVER_WS_URL", ""), "/"),
-		ExecutorID:              env("AUTOWONDER_EXECUTOR_ID", ""),
-		ExecutorToken:           env("AUTOWONDER_EXECUTOR_TOKEN", ""),
-		Provider:                strings.ToLower(env("AUTOWONDER_PROVIDER", "opencode")),
-		AgentPath:               env("AUTOWONDER_AGENT_PATH", ""),
-		AgentModel:              env("AUTOWONDER_AGENT_MODEL", ""),
-		ReasoningEffort:         env("AUTOWONDER_REASONING_EFFORT", ""),
-		ContextWindow:           env("AUTOWONDER_CONTEXT_WINDOW", ""),
-		WorkspaceRoot:           env("AUTOWONDER_WORKSPACE_ROOT", defaultWorkspaceRoot()),
-		MaxConcurrent:           envInt("AUTOWONDER_MAX_CONCURRENT_DISPATCHES", 1, 1, 10),
-		HeartbeatSeconds:        envInt("AUTOWONDER_HEARTBEAT_SECONDS", 30, 5, 60),
-		LogLevel:                strings.ToLower(env("AUTOWONDER_LOG_LEVEL", "info")),
-		Unattended:              envBool("AUTOWONDER_UNATTENDED", true),
-		UploadArtifacts:         envBool("AUTOWONDER_UPLOAD_ARTIFACTS", true),
-		OpenCodePermissionFlag:  env("AUTOWONDER_OPENCODE_PERMISSION_FLAG", "--auto"),
-		OpenCodePromptFlag:      env("AUTOWONDER_OPENCODE_PROMPT_FLAG", ""),
-		PiProvider:              env("AUTOWONDER_PI_PROVIDER", ""),
-		OpenCodeACP:             envBool("AUTOWONDER_OPENCODE_ACP", true),
-		MemoryMode:              env("AUTOWONDER_MEMORY_MODE", "platform"),
-		DaemonName:              env("AUTOWONDER_DAEMON_NAME", ""),
-		RequirePackageSignature: envBool("AUTOWONDER_REQUIRE_PACKAGE_SIGNATURE", false),
-		UpdateBaseURL:           env("AUTOWONDER_UPDATE_BASE_URL", ""),
-		UpdatePublicKey:         env("AUTOWONDER_UPDATE_PUBLIC_KEY", ""),
-		UpdateInsecure:          envBool("AUTOWONDER_UPDATE_INSECURE", false),
+		ServerWSURL:                strings.TrimRight(env("AUTOWONDER_SERVER_WS_URL", ""), "/"),
+		ExecutorID:                 env("AUTOWONDER_EXECUTOR_ID", ""),
+		ExecutorToken:              env("AUTOWONDER_EXECUTOR_TOKEN", ""),
+		Provider:                   strings.ToLower(env("AUTOWONDER_PROVIDER", "opencode")),
+		AgentPath:                  env("AUTOWONDER_AGENT_PATH", ""),
+		AgentModel:                 env("AUTOWONDER_AGENT_MODEL", ""),
+		ReasoningEffort:            env("AUTOWONDER_REASONING_EFFORT", ""),
+		ContextWindow:              env("AUTOWONDER_CONTEXT_WINDOW", ""),
+		WorkspaceRoot:              env("AUTOWONDER_WORKSPACE_ROOT", defaultWorkspaceRoot()),
+		MaxConcurrent:              envInt("AUTOWONDER_MAX_CONCURRENT_DISPATCHES", 1, 1, 10),
+		HeartbeatSeconds:           envInt("AUTOWONDER_HEARTBEAT_SECONDS", 30, 5, 60),
+		LogLevel:                   strings.ToLower(env("AUTOWONDER_LOG_LEVEL", "info")),
+		Unattended:                 envBool("AUTOWONDER_UNATTENDED", true),
+		UploadArtifacts:            envBool("AUTOWONDER_UPLOAD_ARTIFACTS", true),
+		AttachmentAllowedHosts:     envList("AUTOWONDER_ATTACHMENT_ALLOWED_HOSTS"),
+		WorkspaceGCEnabled:         envBool("AUTOWONDER_WORKSPACE_GC_ENABLED", true),
+		WorkspaceGCInitialDelay:    envDuration("AUTOWONDER_WORKSPACE_GC_INITIAL_DELAY", 30*time.Second),
+		WorkspaceGCInterval:        envDuration("AUTOWONDER_WORKSPACE_GC_INTERVAL", 15*time.Minute),
+		WorkspaceGCTaskTTL:         envDuration("AUTOWONDER_WORKSPACE_GC_TASK_TTL", 48*time.Hour),
+		WorkspaceGCConversationTTL: envDuration("AUTOWONDER_WORKSPACE_GC_CONVERSATION_TTL", 720*time.Hour),
+		WorkspaceGCHighWatermark:   envInt("AUTOWONDER_WORKSPACE_GC_HIGH_WATERMARK_PERCENT", 85, 1, 100),
+		WorkspaceGCLowWatermark:    envInt("AUTOWONDER_WORKSPACE_GC_LOW_WATERMARK_PERCENT", 75, 1, 100),
+		WorkspaceGCMinFreeBytes:    envInt64("AUTOWONDER_WORKSPACE_GC_MIN_FREE_BYTES", 10<<30),
+		WorkspaceGCTargetFreeBytes: envInt64("AUTOWONDER_WORKSPACE_GC_TARGET_FREE_BYTES", 15<<30),
+		OpenCodePermissionFlag:     env("AUTOWONDER_OPENCODE_PERMISSION_FLAG", "--auto"),
+		OpenCodePromptFlag:         env("AUTOWONDER_OPENCODE_PROMPT_FLAG", ""),
+		PiProvider:                 env("AUTOWONDER_PI_PROVIDER", ""),
+		OpenCodeACP:                envBool("AUTOWONDER_OPENCODE_ACP", true),
+		MemoryMode:                 env("AUTOWONDER_MEMORY_MODE", "platform"),
+		DaemonName:                 env("AUTOWONDER_DAEMON_NAME", ""),
+		RequirePackageSignature:    envBool("AUTOWONDER_REQUIRE_PACKAGE_SIGNATURE", false),
+		UpdateBaseURL:              env("AUTOWONDER_UPDATE_BASE_URL", ""),
+		UpdatePublicKey:            env("AUTOWONDER_UPDATE_PUBLIC_KEY", ""),
+		UpdateInsecure:             envBool("AUTOWONDER_UPDATE_INSECURE", false),
 	}
 	return validate(cfg)
 }
@@ -88,30 +109,40 @@ func load() (Config, error) {
 // environment variables as the container/systemd entry point.
 func LoadFromArgs(args []string) (Config, error) {
 	cfg := Config{
-		ServerWSURL:             env("AUTOWONDER_SERVER_WS_URL", ""),
-		ExecutorID:              env("AUTOWONDER_EXECUTOR_ID", ""),
-		ExecutorToken:           env("AUTOWONDER_EXECUTOR_TOKEN", ""),
-		Provider:                strings.ToLower(env("AUTOWONDER_PROVIDER", "opencode")),
-		AgentPath:               env("AUTOWONDER_AGENT_PATH", ""),
-		AgentModel:              env("AUTOWONDER_AGENT_MODEL", ""),
-		ReasoningEffort:         env("AUTOWONDER_REASONING_EFFORT", ""),
-		ContextWindow:           env("AUTOWONDER_CONTEXT_WINDOW", ""),
-		WorkspaceRoot:           env("AUTOWONDER_WORKSPACE_ROOT", defaultWorkspaceRoot()),
-		MaxConcurrent:           envInt("AUTOWONDER_MAX_CONCURRENT_DISPATCHES", 1, 1, 10),
-		HeartbeatSeconds:        envInt("AUTOWONDER_HEARTBEAT_SECONDS", 30, 5, 60),
-		LogLevel:                strings.ToLower(env("AUTOWONDER_LOG_LEVEL", "info")),
-		Unattended:              envBool("AUTOWONDER_UNATTENDED", true),
-		UploadArtifacts:         envBool("AUTOWONDER_UPLOAD_ARTIFACTS", true),
-		OpenCodePermissionFlag:  env("AUTOWONDER_OPENCODE_PERMISSION_FLAG", "--auto"),
-		OpenCodePromptFlag:      env("AUTOWONDER_OPENCODE_PROMPT_FLAG", ""),
-		PiProvider:              env("AUTOWONDER_PI_PROVIDER", ""),
-		OpenCodeACP:             envBool("AUTOWONDER_OPENCODE_ACP", true),
-		MemoryMode:              env("AUTOWONDER_MEMORY_MODE", "platform"),
-		DaemonName:              env("AUTOWONDER_DAEMON_NAME", ""),
-		RequirePackageSignature: envBool("AUTOWONDER_REQUIRE_PACKAGE_SIGNATURE", false),
-		UpdateBaseURL:           env("AUTOWONDER_UPDATE_BASE_URL", ""),
-		UpdatePublicKey:         env("AUTOWONDER_UPDATE_PUBLIC_KEY", ""),
-		UpdateInsecure:          envBool("AUTOWONDER_UPDATE_INSECURE", false),
+		ServerWSURL:                env("AUTOWONDER_SERVER_WS_URL", ""),
+		ExecutorID:                 env("AUTOWONDER_EXECUTOR_ID", ""),
+		ExecutorToken:              env("AUTOWONDER_EXECUTOR_TOKEN", ""),
+		Provider:                   strings.ToLower(env("AUTOWONDER_PROVIDER", "opencode")),
+		AgentPath:                  env("AUTOWONDER_AGENT_PATH", ""),
+		AgentModel:                 env("AUTOWONDER_AGENT_MODEL", ""),
+		ReasoningEffort:            env("AUTOWONDER_REASONING_EFFORT", ""),
+		ContextWindow:              env("AUTOWONDER_CONTEXT_WINDOW", ""),
+		WorkspaceRoot:              env("AUTOWONDER_WORKSPACE_ROOT", defaultWorkspaceRoot()),
+		MaxConcurrent:              envInt("AUTOWONDER_MAX_CONCURRENT_DISPATCHES", 1, 1, 10),
+		HeartbeatSeconds:           envInt("AUTOWONDER_HEARTBEAT_SECONDS", 30, 5, 60),
+		LogLevel:                   strings.ToLower(env("AUTOWONDER_LOG_LEVEL", "info")),
+		Unattended:                 envBool("AUTOWONDER_UNATTENDED", true),
+		UploadArtifacts:            envBool("AUTOWONDER_UPLOAD_ARTIFACTS", true),
+		AttachmentAllowedHosts:     envList("AUTOWONDER_ATTACHMENT_ALLOWED_HOSTS"),
+		WorkspaceGCEnabled:         envBool("AUTOWONDER_WORKSPACE_GC_ENABLED", true),
+		WorkspaceGCInitialDelay:    envDuration("AUTOWONDER_WORKSPACE_GC_INITIAL_DELAY", 30*time.Second),
+		WorkspaceGCInterval:        envDuration("AUTOWONDER_WORKSPACE_GC_INTERVAL", 15*time.Minute),
+		WorkspaceGCTaskTTL:         envDuration("AUTOWONDER_WORKSPACE_GC_TASK_TTL", 48*time.Hour),
+		WorkspaceGCConversationTTL: envDuration("AUTOWONDER_WORKSPACE_GC_CONVERSATION_TTL", 720*time.Hour),
+		WorkspaceGCHighWatermark:   envInt("AUTOWONDER_WORKSPACE_GC_HIGH_WATERMARK_PERCENT", 85, 1, 100),
+		WorkspaceGCLowWatermark:    envInt("AUTOWONDER_WORKSPACE_GC_LOW_WATERMARK_PERCENT", 75, 1, 100),
+		WorkspaceGCMinFreeBytes:    envInt64("AUTOWONDER_WORKSPACE_GC_MIN_FREE_BYTES", 10<<30),
+		WorkspaceGCTargetFreeBytes: envInt64("AUTOWONDER_WORKSPACE_GC_TARGET_FREE_BYTES", 15<<30),
+		OpenCodePermissionFlag:     env("AUTOWONDER_OPENCODE_PERMISSION_FLAG", "--auto"),
+		OpenCodePromptFlag:         env("AUTOWONDER_OPENCODE_PROMPT_FLAG", ""),
+		PiProvider:                 env("AUTOWONDER_PI_PROVIDER", ""),
+		OpenCodeACP:                envBool("AUTOWONDER_OPENCODE_ACP", true),
+		MemoryMode:                 env("AUTOWONDER_MEMORY_MODE", "platform"),
+		DaemonName:                 env("AUTOWONDER_DAEMON_NAME", ""),
+		RequirePackageSignature:    envBool("AUTOWONDER_REQUIRE_PACKAGE_SIGNATURE", false),
+		UpdateBaseURL:              env("AUTOWONDER_UPDATE_BASE_URL", ""),
+		UpdatePublicKey:            env("AUTOWONDER_UPDATE_PUBLIC_KEY", ""),
+		UpdateInsecure:             envBool("AUTOWONDER_UPDATE_INSECURE", false),
 	}
 	flags := flag.NewFlagSet("autowonder-runtime connect", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
@@ -246,6 +277,45 @@ func envBool(name string, fallback bool) bool {
 	}
 	parsed, err := strconv.ParseBool(raw)
 	if err != nil {
+		return fallback
+	}
+	return parsed
+}
+
+func envList(name string) []string {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	result := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if value := strings.TrimSpace(part); value != "" {
+			result = append(result, value)
+		}
+	}
+	return result
+}
+
+func envDuration(name string, fallback time.Duration) time.Duration {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback
+	}
+	parsed, err := time.ParseDuration(raw)
+	if err != nil || parsed < 0 {
+		return fallback
+	}
+	return parsed
+}
+
+func envInt64(name string, fallback int64) int64 {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback
+	}
+	parsed, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || parsed < 0 {
 		return fallback
 	}
 	return parsed

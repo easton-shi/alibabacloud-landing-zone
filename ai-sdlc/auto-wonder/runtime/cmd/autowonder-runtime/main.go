@@ -14,6 +14,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"os/exec"
 	"os/signal"
 	"strconv"
 	"strings"
@@ -28,6 +29,7 @@ import (
 	"github.com/aliyun/alibabacloud-landing-zone/ai-sdlc/auto-wonder/runtime/internal/protocol"
 	"github.com/aliyun/alibabacloud-landing-zone/ai-sdlc/auto-wonder/runtime/internal/provider"
 	"github.com/aliyun/alibabacloud-landing-zone/ai-sdlc/auto-wonder/runtime/internal/update"
+	"github.com/aliyun/alibabacloud-landing-zone/ai-sdlc/auto-wonder/runtime/internal/workspacegc"
 	"github.com/aliyun/alibabacloud-landing-zone/ai-sdlc/auto-wonder/runtime/internal/ws"
 )
 
@@ -111,6 +113,14 @@ func run(ctx context.Context, cfg config.Config, engine provider.Provider, start
 	executable, _ := os.Executable()
 	updater := update.New(update.Config{BaseURL: cfg.UpdateBaseURL, PublicKey: cfg.UpdatePublicKey,
 		Insecure: cfg.UpdateInsecure}, version, executable, cfg.UpdateReceiptPath())
+	if updater != nil {
+		if rolledBack, recoveryErr := updater.RecoverPending(); recoveryErr != nil {
+			slog.Error("recover pending update", "error", recoveryErr)
+		} else if rolledBack {
+			slog.Warn("rolled back runtime update; restarting previous version")
+			return rerunAfterRollback(executable)
+		}
+	}
 	backoff := time.Second
 	for {
 		connected, err := serve(ctx, cfg, engine, conversations, updater, startedAt)
@@ -137,6 +147,15 @@ func run(ctx context.Context, cfg config.Config, engine provider.Provider, start
 	}
 }
 
+func rerunAfterRollback(executable string) error {
+	cmd := exec.Command(executable, os.Args[1:]...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Env = append(os.Environ(), "AUTOWONDER_UPGRADE_ROLLED_BACK=1")
+	return cmd.Run()
+}
+
 // serve runs one WebSocket session. Disconnecting cancels in-flight dispatches;
 // the next session reconnects and the server re-delivers anything that still
 // needs execution.
@@ -153,6 +172,18 @@ func serve(ctx context.Context, cfg config.Config, engine provider.Provider,
 	defer conversations.Detach()
 
 	runner := dispatch.New(cfg, client, engine)
+	runner.ReplayOutbox()
+	go replayDispatchOutbox(sessionCtx, runner)
+	if cfg.WorkspaceGCEnabled {
+		go runWorkspaceGC(sessionCtx, cfg, workspacegc.Collector{
+			Root: cfg.WorkspaceRoot, TaskTTL: cfg.WorkspaceGCTaskTTL,
+			ConversationTTL:  cfg.WorkspaceGCConversationTTL,
+			IsDispatchActive: runner.Owns, IsConversationActive: conversations.ConversationActive,
+			HighWatermark: cfg.WorkspaceGCHighWatermark, LowWatermark: cfg.WorkspaceGCLowWatermark,
+			MinFreeBytes: cfg.WorkspaceGCMinFreeBytes, TargetFreeBytes: cfg.WorkspaceGCTargetFreeBytes,
+			DiskUsage: workspacegc.ReadDiskUsage,
+		})
+	}
 	executorID, _ := strconv.ParseInt(cfg.ExecutorID, 10, 64)
 	executable, _ := os.Executable()
 	controlHandler := &control.Handler{
@@ -183,6 +214,50 @@ func serve(ctx context.Context, cfg config.Config, engine provider.Provider,
 		}
 		conversations.Handle(sessionCtx, payload)
 		runner.Handle(sessionCtx, payload)
+	}
+}
+
+func replayDispatchOutbox(ctx context.Context, runner *dispatch.Runner) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			runner.ReplayOutbox()
+		}
+	}
+}
+
+func runWorkspaceGC(ctx context.Context, cfg config.Config, collector workspacegc.Collector) {
+	if delay := cfg.WorkspaceGCInitialDelay; delay > 0 {
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+	}
+	interval := cfg.WorkspaceGCInterval
+	if interval <= 0 {
+		interval = 15 * time.Minute
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		report, err := collector.RunOnce(ctx)
+		if err != nil {
+			slog.Warn("workspace GC failed", "error", err)
+		} else if len(report.Removed) > 0 {
+			slog.Info("workspace GC completed", "removed", len(report.Removed))
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
 	}
 }
 
@@ -380,7 +455,6 @@ func runtimeFeatures(conversations *conversation.Handler, updater *update.Update
 		"TASK_PACKAGE_SIGNATURE_V1",
 		"TASK_PACKAGE_HOOKS_V1",
 		"DEBUG_LOG_V1",
-		"CHECKPOINT_LIGHTWEIGHT_V1",
 		"DISPATCH_REQUESTS_V1",
 		"EXECUTOR_RESTART_V1",
 		"EXECUTOR_RESTART_POLICY_V1",
@@ -391,11 +465,12 @@ func runtimeFeatures(conversations *conversation.Handler, updater *update.Update
 		"CONVERSATION_ANSWER_DELIVERY_V1",
 		"CONVERSATION_DELIVERY_ACK_V1",
 		"ATTACHMENT_MANIFEST_V1",
+		"terminal_steer_v1",
 	}
 	if conversations.SupportsACP() {
 		features = append(features, "CONVERSATION_ACP_INTERACTION_V1")
 	}
-	if updater != nil && version != "" && version != "dev" {
+	if updater.SupportsSelfUpdate() && version != "" && version != "dev" {
 		features = append(features, "EXECUTOR_UPDATE_V1", "EXECUTOR_UPDATE_RESTART_V1")
 	}
 	if providerName == "claude" {

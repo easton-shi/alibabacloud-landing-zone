@@ -29,8 +29,8 @@ AW_E2E_APP_PORT="${AW_E2E_APP_PORT:-7001}"
 
 AW_E2E_MYSQL_IMAGE="${AW_E2E_MYSQL_IMAGE:-mysql:8.0}"
 AW_E2E_REDIS_IMAGE="${AW_E2E_REDIS_IMAGE:-redis:7-alpine}"
-AW_E2E_MINIO_IMAGE="${AW_E2E_MINIO_IMAGE:-quay.io/minio/minio:latest}"
-AW_E2E_MC_IMAGE="${AW_E2E_MC_IMAGE:-quay.io/minio/mc:latest}"
+AW_E2E_MINIO_IMAGE="${AW_E2E_MINIO_IMAGE:-quay.io/minio/aistor/minio:latest}"
+AW_E2E_MC_IMAGE="${AW_E2E_MC_IMAGE:-quay.io/minio/aistor/minio:latest}"
 
 # Public mirror of the Docker Official Images, used only when the primary
 # registry is unreachable. This is a public AWS endpoint, not an internal one.
@@ -38,6 +38,8 @@ AW_E2E_OFFICIAL_IMAGE_MIRROR="${AW_E2E_OFFICIAL_IMAGE_MIRROR:-public.ecr.aws/doc
 
 AW_E2E_BUCKET="${AW_E2E_BUCKET:-aw-e2e-autowonder}"
 AW_E2E_MINIO_ROOT_USER="${AW_E2E_MINIO_ROOT_USER:-aw-e2e-minio}"
+AW_E2E_MINIO_LICENSE_FILE="${AW_E2E_MINIO_LICENSE_FILE:-}"
+AW_E2E_MINIO_LICENSE="${AW_E2E_MINIO_LICENSE:-}"
 
 # Compose file defaults are the community file plus the end-to-end layer.
 AW_E2E_BASE_COMPOSE="${AW_E2E_BASE_COMPOSE:-$REPO_ROOT/docs/community/docker-compose.dependencies.yml}"
@@ -53,6 +55,7 @@ export AW_E2E_MYSQL_PORT AW_E2E_REDIS_PORT
 export AW_E2E_MINIO_PORT AW_E2E_MINIO_CONSOLE_PORT AW_E2E_APP_PORT
 export AW_E2E_MYSQL_IMAGE AW_E2E_REDIS_IMAGE AW_E2E_MINIO_IMAGE AW_E2E_MC_IMAGE
 export AW_E2E_BUCKET AW_E2E_MINIO_ROOT_USER
+export AW_E2E_MINIO_LICENSE_FILE AW_E2E_MINIO_LICENSE
 
 log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
 die() { printf 'FATAL: %s\n' "$*" >&2; exit 1; }
@@ -278,6 +281,39 @@ aw_e2e_minio_internal_port() {
 aw_e2e_prepare_state_dir() {
   mkdir -p "$AW_E2E_STATE_DIR"
   chmod 700 "$AW_E2E_STATE_DIR"
+}
+
+# AIStor images require a license JWT. Accept either a path to an existing
+# license file or the JWT itself. The resulting file is mounted read-only at
+# /minio.license by compose.e2e.yml.
+aw_e2e_prepare_minio_license() {
+  case "$AW_E2E_MINIO_IMAGE" in
+    *aistor*) ;;
+    *) return 0 ;;
+  esac
+
+  if [[ -n "${AW_E2E_MINIO_LICENSE_FILE:-}" ]]; then
+    [[ -f "$AW_E2E_MINIO_LICENSE_FILE" ]] || die "MinIO license file not found: $AW_E2E_MINIO_LICENSE_FILE"
+    if command -v realpath >/dev/null 2>&1; then
+      AW_E2E_MINIO_LICENSE_FILE="$(realpath "$AW_E2E_MINIO_LICENSE_FILE")"
+    else
+      AW_E2E_MINIO_LICENSE_FILE="$(cd "$(dirname "$AW_E2E_MINIO_LICENSE_FILE")" && pwd -P)/$(basename "$AW_E2E_MINIO_LICENSE_FILE")"
+    fi
+  elif [[ -n "${AW_E2E_MINIO_LICENSE:-}" ]]; then
+    AW_E2E_MINIO_LICENSE_FILE="$AW_E2E_STATE_DIR/minio.license"
+    (umask 077; printf '%s' "$AW_E2E_MINIO_LICENSE" >"$AW_E2E_MINIO_LICENSE_FILE")
+    chmod 600 "$AW_E2E_MINIO_LICENSE_FILE"
+    unset AW_E2E_MINIO_LICENSE
+  else
+    die "MinIO AIStor requires a license; set AW_E2E_MINIO_LICENSE_FILE or AW_E2E_MINIO_LICENSE"
+  fi
+
+  [[ -s "$AW_E2E_MINIO_LICENSE_FILE" ]] || die "MinIO license file is empty: $AW_E2E_MINIO_LICENSE_FILE"
+  if [[ "$(head -c 3 "$AW_E2E_MINIO_LICENSE_FILE")" != "eyJ" ]]; then
+    die "MinIO license file does not look like a JWT: $AW_E2E_MINIO_LICENSE_FILE"
+  fi
+  export AW_E2E_MINIO_LICENSE_FILE
+  log "MinIO AIStor license ready"
 }
 
 # ---------------------------------------------------------------------------

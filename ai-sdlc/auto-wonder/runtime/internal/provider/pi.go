@@ -12,11 +12,22 @@ import (
 
 // Pi runs `pi -p --mode json`. Its stdout is mostly NDJSON but may include
 // control markup (`call:` / `response:`), so parsing is deliberately lenient.
-type Pi struct{}
+type Pi struct {
+	registry activeTurnRegistry
+}
 
 func (p *Pi) Name() string { return "pi" }
 
+func (p *Pi) Steer(ctx context.Context, dispatchID int64, content string) error {
+	return p.registry.steer(ctx, dispatchID, content)
+}
+
 func (p *Pi) Run(ctx context.Context, req Request, emit func(Event)) (Result, error) {
+	return runSteerable(ctx, req, emit, &p.registry, p.runOnce)
+}
+
+func (p *Pi) runOnce(ctx context.Context, req Request, prompt string, emit func(Event), onStart func(error)) (Result, error) {
+	req.Prompt = prompt
 	args := buildPiArgs(req)
 	sessionID := req.SessionID
 	if sessionID == "" {
@@ -32,7 +43,12 @@ func (p *Pi) Run(ctx context.Context, req Request, emit func(Event)) (Result, er
 	var summary strings.Builder
 	reportedSession := ""
 	var engineErr string
-	stream := streamCommand(ctx, agentCommand(req.AgentPath, "pi"), args, req.WorkDir, envSlice(currentEnv(), req.Env), func(line string) {
+	env, err := MergeEnvironment(currentEnv(), req.Env)
+	if err != nil {
+		onStart(err)
+		return Result{}, fmt.Errorf("pi environment: %w", err)
+	}
+	stream := streamCommandWithStart(ctx, agentCommand(req.AgentPath, "pi"), args, req.WorkDir, env, func(line string) {
 		emit(Event{Kind: "stdout", Text: truncate(line, 2000)})
 		kind, text, session, _ := parsePiLine(line)
 		if session != "" && reportedSession == "" {
@@ -53,7 +69,7 @@ func (p *Pi) Run(ctx context.Context, req Request, emit func(Event)) (Result, er
 		}
 	}, func(line string) {
 		emit(Event{Kind: "stderr", Text: truncate(line, 2000)})
-	})
+	}, onStart)
 	if stream.err != nil && stream.exitCode != 0 {
 		message := stream.stderr
 		if message == "" {

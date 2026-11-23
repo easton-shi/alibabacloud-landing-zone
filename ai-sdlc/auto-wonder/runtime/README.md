@@ -7,6 +7,9 @@
 > **非官方组件。** 本项目不属于阿里云官方发布物，使用前请先在隔离环境验证。
 > 仓库根目录的 MIT License 同样适用于本目录中的新增代码。
 
+当前模块职责、服务端调用关系和完整链路见
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
+
 ## 它做什么
 
 Runtime 以 executor 身份连接 AutoWonder 服务端，完成一次 dispatch 的完整本地执行：
@@ -19,7 +22,8 @@ Runtime 以 executor 身份连接 AutoWonder 服务端，完成一次 dispatch �
 6. 合并任务包中的 MCP 配置与 dispatch token，写成 `0600` 的 `mcp.config.json`。
 7. 拉起 Codex、OpenCode、Pi 或 Claude Code，把事件归一成 `TASK_PROGRESS`。
 8. 记录最终 branch/HEAD 到 `deliverables/runtime-source-revision.json`。
-9. 上传 `artifacts/output/**`，发送 `TASK_RESULT`，必要时发送 `TASK_HANDOFF`。
+9. 接受 `completion_requested.evidenceRefs`，只上传被引用的 typed 产物和 source revision，
+   然后发送 `TASK_RESULT`，必要时发送 `TASK_HANDOFF`。旧协议服务端仍兼容整树上传。
 10. WebSocket 断开后指数退避重连；退出时取消在途 dispatch。
 11. 收到非 cancel 的 `TASK_PAUSE` 时，把仓库提交状态打成 checkpoint 上传，并回 `TASK_PAUSED`；恢复时按 checkpoint 的 commit 重新检出。
 12. 协商到 `DEBUG_LOG_V1` 时，把 dispatch 生命周期、Agent 事件和原始 stdout/stderr 写入有上限的日志，结束后直传或经产物中转上传。
@@ -39,12 +43,26 @@ Runtime 以 executor 身份连接 AutoWonder 服务端，完成一次 dispatch �
 | `pi` | `pi -p --mode json` | `--session <file>` | 会话文件落在 workspace 的 `.pi/sessions/` |
 | `claude` | `claude -p --output-format stream-json` | `--resume` | 保留社区执行器的 headless 行为 |
 
+### Steering 与 Guidance
+
+Runtime 向服务端声明 `terminal_steer_v1` 能力。对于活跃的 dispatch turn，服务端可以通过
+`TASK_STEER`（终止式 steering）或 `TASK_GUIDANCE`（非终止式 guidance，`mode=SAFE_STEER`）
+下发人工引导。四个 provider 都实现 `provider.Steerable`：
+
+- **Codex**：使用原生 `turn/steer` 请求，不中断当前 turn。
+- **OpenCode**：取消当前 turn，然后使用同一 session（CLI 的 `--session` 或 ACP 的 `session/load`）恢复并提交 steering 内容。
+- **Pi**：取消当前 turn，然后使用同一 session（`--session`）恢复并提交 steering 内容。
+- **Claude Code**：取消当前 turn，然后使用同一 session（`--resume`）恢复并提交 steering 内容。
+
+Runtime 对 `TASK_STEER`/`TASK_GUIDANCE` 进行去重，缓存 ACK，并在重复投递时重放。没有活跃 turn 或 provider 不支持 steering 时返回 `FAILED` ACK。
+
 Runtime 不使用统一的 ACP 协议驱动这四个 CLI。原因是它们的进程模型、权限参数、
 流事件和会话恢复方式不同；差异收敛在 `internal/provider`，上层只处理统一的 `Event`。
 
 交互式会话另有一条 ACP 桥：Codex app-server 的审批 / elicitation / requestUserInput
-会转成 `acp_elicitation` 事件，用户回答后回填到原生 RPC。只有 Codex 声明
-`CONVERSATION_ACP_INTERACTION_V1`；其他三个 provider 以文字提问。
+会转成 `acp_elicitation` 事件；OpenCode ACP 可用时也会桥接原生权限请求。用户回答后
+回填到原生 RPC。当前由 Codex 或支持 ACP 的 OpenCode 声明
+`CONVERSATION_ACP_INTERACTION_V1`；Pi、Claude 仍以文字提问。
 
 ## 环境要求
 
@@ -91,12 +109,25 @@ make vet
 | `AUTOWONDER_REASONING_EFFORT` | 空 | 推理强度；Codex 映射为 `-c model_reasoning_effort=...` |
 | `AUTOWONDER_CONTEXT_WINDOW` | 空 | 上下文窗口；Codex 映射为 `-c model_context_window=...` |
 | `AUTOWONDER_WORKSPACE_ROOT` | `~/.autowonder/runtime` | 每次 dispatch 在这里建独立目录 |
-| `AUTOWONDER_MAX_CONCURRENT_DISPATCHES` | `1` | 并发执行数，范围 1–50 |
+| `AUTOWONDER_MAX_CONCURRENT_DISPATCHES` | `1` | 并发执行数，范围 1–10 |
 | `AUTOWONDER_HEARTBEAT_SECONDS` | `30` | 心跳间隔，范围 5–60 秒 |
 | `AUTOWONDER_LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
 | `AUTOWONDER_UNATTENDED` | `true` | Codex 是否附加无人值守参数 |
 | `AUTOWONDER_UPLOAD_ARTIFACTS` | `true` | 是否上传 `artifacts/output/**` |
 | `AUTOWONDER_REQUIRE_PACKAGE_SIGNATURE` | `false` | 为 `true` 时拒绝未签名的任务包；生产环境建议开启 |
+| `AUTOWONDER_ATTACHMENT_ALLOWED_HOSTS` | 服务端 host + `*.aliyuncs.com` | 允许会话附件下载的额外 host，逗号分隔；支持 `*.example.com` |
+| `AUTOWONDER_WORKSPACE_GC_ENABLED` | `true` | 启用本地工作区 TTL 清理 |
+| `AUTOWONDER_WORKSPACE_GC_INITIAL_DELAY` | `30s` | 启动后首次 GC 延迟 |
+| `AUTOWONDER_WORKSPACE_GC_INTERVAL` | `15m` | GC 检查间隔 |
+| `AUTOWONDER_WORKSPACE_GC_TASK_TTL` | `48h` | 已终态 dispatch capsule 保留时长 |
+| `AUTOWONDER_WORKSPACE_GC_CONVERSATION_TTL` | `720h` | 无活动会话 workspace 保留时长 |
+| `AUTOWONDER_WORKSPACE_GC_HIGH_WATERMARK_PERCENT` | `85` | 磁盘压力模式触发阈值 |
+| `AUTOWONDER_WORKSPACE_GC_LOW_WATERMARK_PERCENT` | `75` | 压力模式回收目标阈值 |
+| `AUTOWONDER_WORKSPACE_GC_MIN_FREE_BYTES` | `10 GiB` | 压力模式最小剩余空间 |
+| `AUTOWONDER_WORKSPACE_GC_TARGET_FREE_BYTES` | `15 GiB` | 压力模式目标剩余空间 |
+| `AUTOWONDER_UPDATE_BASE_URL` | 空 | 安全自更新 manifest/artifact 源；空表示不启用 |
+| `AUTOWONDER_UPDATE_PUBLIC_KEY` | 空 | manifest 签名校验用的 Ed25519 PKIX 公钥（base64） |
+| `AUTOWONDER_UPDATE_INSECURE` | `false` | 仅本地测试允许 HTTP 或未签名 manifest |
 
 Provider 专用变量：
 
@@ -137,42 +168,61 @@ codex login status
 
 ## Docker 部署
 
-镜像只包含 Runtime、Git 和 SSH 客户端，不内置任何 Agent CLI。这样不会把模型凭据、
-Node/Python 运行时和特定版本 CLI 固化进同一个镜像。
+镜像包含 Runtime、OpenCode v2、Codex、Node.js、Git 和 SSH 客户端。构建时默认安装
+两个 Agent CLI 的 `latest` 版本，并立即执行 `--version` 验证安装结果。
 
 ```bash
 cd ai-sdlc/auto-wonder/runtime
-docker build -t autowonder-runtime:local .
+docker build \
+  --build-arg OPENCODE_VERSION=latest \
+  --build-arg CODEX_VERSION=latest \
+  -t autowonder-runtime:local .
 ```
 
-需要 Codex 时做一个很薄的派生镜像：
-
-```dockerfile
-FROM autowonder-runtime:local
-USER root
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends nodejs npm \
-    && npm install -g @openai/codex \
-    && rm -rf /var/lib/apt/lists/*
-USER autowonder
-```
-
-运行示例：
+需要可复现构建时，把两个构建参数固定到具体版本：
 
 ```bash
-docker run --rm --name autowonder-runtime \
+docker build \
+  --build-arg OPENCODE_VERSION=2.3.2 \
+  --build-arg CODEX_VERSION=0.171.0 \
+  -t autowonder-runtime:local .
+```
+
+镜像使用独立用户和独立配置目录：
+
+- OpenCode：`/home/autowonder/.config/opencode/opencode.json`
+- Codex：`/home/autowonder/.codex/config.toml`
+- 工作区：`/var/lib/autowonder/runtime`
+
+内置配置不包含模型密钥、MCP、OpenViking 插件或宿主机全局配置；OpenCode 使用独立
+配置目录，Codex 关闭插件和 memories。模型凭据通过容器环境变量注入，
+`LITELLM_API_KEY` 会分别作为 OpenCode 的 `apiKey` 和 Codex 的 `env_key` 使用。
+容器本身承担进程和文件隔离，因此 Codex 不在容器内再启用不可用的 `bubblewrap`
+嵌套沙箱，而使用 `danger-full-access` 和 `approval_policy = "never"`。
+
+确认镜像内的 CLI 版本：
+
+```bash
+docker run --rm --entrypoint sh autowonder-runtime:local -lc \
+  'opencode --version && codex --version'
+```
+
+运行示例。测试 Runtime 时不要挂载宿主机的 `~/.config/opencode`、`~/.opencode`
+或整套 `~/.codex`，只按需挂载 Git 认证文件：
+
+```bash
+docker run --rm --name autowonder-runtime --network host \
   --env-file "$HOME/.autowonder/runtime.env" \
-  -e AUTOWONDER_PROVIDER=codex \
-  -e AUTOWONDER_AGENT_PATH=/usr/local/bin/codex \
+  -e AUTOWONDER_PROVIDER=opencode \
   -e AUTOWONDER_WORKSPACE_ROOT=/var/lib/autowonder/runtime \
   -v "$HOME/.autowonder/workspace:/var/lib/autowonder" \
-  -v "$HOME/.codex:/home/autowonder/.codex" \
   -v "$HOME/.ssh:/home/autowonder/.ssh:ro" \
   -v "$HOME/.gitconfig:/home/autowonder/.gitconfig:ro" \
   autowonder-runtime:local
 ```
 
 `runtime.env` 必须由你自行创建并设为 `0600`，不要把 token 写进镜像或仓库。
+本地 AutoWonder 监听 `127.0.0.1` 时需要使用 `--network host`；非本地部署可去掉。
 
 ## 调度协议关键点
 
@@ -203,18 +253,18 @@ docker run --rm --name autowonder-runtime \
 
 - checkpoint 只保存已提交的仓库状态；Agent 未提交的工作区改动不会进入 checkpoint。
 - 已实现 Ed25519 任务包签名校验；未签名任务包只在 `AUTOWONDER_REQUIRE_PACKAGE_SIGNATURE=false` 时放行。
-- `beforeTool` / `afterTool` 尚未接入任何 provider 的原生工具拦截，因此不声明
-  `TASK_PACKAGE_TOOL_HOOKS_V1`；绑定工具 hook 的任务会被服务端拒绝，而不是静默跳过。
-- 人工门禁已桥接 Codex app-server 的审批、elicitation 和 requestUserInput；OpenCode、
-  Pi、Claude 目前只能通过 `AUTOWONDER_LOCAL_API_ENDPOINT/request-input` 主动调用。
-- 未声明 `EXECUTOR_UPDATE_V1` / `EXECUTOR_UPDATE_RESTART_V1`：Runtime 没有发布源，
-  不能安全地下载并替换自身；跨版本升级需在宿主机完成，重启和同版本参数在线应用可用。
+- Claude Code 通过原生 `PreToolUse` / `PostToolUse` 支持 `beforeTool` / `afterTool`；
+  Codex、OpenCode、Pi 尚未声明 `TASK_PACKAGE_TOOL_HOOKS_V1`。
+- 人工门禁已桥接 Codex app-server 的审批、elicitation 和 requestUserInput；
+  检测到 `opencode acp` 时，OpenCode 对话也能使用原生权限卡。Pi、Claude 仍使用
+  `AUTOWONDER_LOCAL_API_ENDPOINT/request-input`。
+- 配置签名更新源后，在非 Windows 主机声明 `EXECUTOR_UPDATE_V1` /
+  `EXECUTOR_UPDATE_RESTART_V1`；安装前执行 `--version` 候选自检，启动版本不匹配时回滚。
 - 会话流式输出、取消和计算中清单已实现。ACP 问答卡只在 Codex 上声明
   `CONVERSATION_ACP_INTERACTION_V1`；OpenCode / Pi / Claude 没有原生交互 RPC，只能以文字提问。
-- 会话的附件清单（`ATTACHMENT_MANIFEST_V1`）、在线产物回传（`ARTIFACT_OUTPUT_V1`）和
-  行动计划（`ACTION_PLAN_V1`）尚未实现，因此不声明对应能力位。
-- 未声明可靠投递（`CONVERSATION_DELIVERY_ACK_V1` / `CONVERSATION_ANSWER_DELIVERY_V1`）：
-  WebSocket 断开时未确认的事件不会跨重连保留，依赖服务端的 stale turn 恢复重投。
+- 会话附件清单（`ATTACHMENT_MANIFEST_V1`）已实现，并限制为服务端/显式配置 host；
+  在线产物回传（`ARTIFACT_OUTPUT_V1`）和行动计划（`ACTION_PLAN_V1`）仍未实现。
+- 会话事件和人工答案的可靠投递使用本地原子 outbox，支持重连和进程重启恢复。
 - `allowCommit`、`allowPush` 当前通过提示词约束，不是 OS 级强制隔离；Git hook 只能
   阻止提交/推送动作，不能限制 Agent 直接改文件。
 - `lazy` 只读仓库不会预克隆；提示词会给出地址、ref 和目标路径，由 Agent 判断需要时自行 clone。

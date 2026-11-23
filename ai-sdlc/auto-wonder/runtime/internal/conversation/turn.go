@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/aliyun/alibabacloud-landing-zone/ai-sdlc/auto-wonder/runtime/internal/capsule"
 	"github.com/aliyun/alibabacloud-landing-zone/ai-sdlc/auto-wonder/runtime/internal/mcpconfig"
@@ -16,6 +17,7 @@ import (
 	"github.com/aliyun/alibabacloud-landing-zone/ai-sdlc/auto-wonder/runtime/internal/protocol"
 	"github.com/aliyun/alibabacloud-landing-zone/ai-sdlc/auto-wonder/runtime/internal/provider"
 	"github.com/aliyun/alibabacloud-landing-zone/ai-sdlc/auto-wonder/runtime/internal/repos"
+	"github.com/aliyun/alibabacloud-landing-zone/ai-sdlc/auto-wonder/runtime/internal/workspacegc"
 )
 
 type turn struct {
@@ -24,25 +26,24 @@ type turn struct {
 	cancel context.CancelFunc
 	frame  protocol.ConversationTurn
 
-	mu           sync.Mutex
-	emitMu       sync.Mutex
-	seq          int64
-	text         strings.Builder
-	sessionID    string
-	canceled     bool
-	abandoned    bool
-	finished     bool
-	finalText    string
-	usage        *protocol.ConversationTurnUsage
-	pending      map[string]*elicitationRequest
-	answerStages map[string]string
-	nextReq      int
+	mu        sync.Mutex
+	emitMu    sync.Mutex
+	seq       int64
+	text      strings.Builder
+	sessionID string
+	canceled  bool
+	abandoned bool
+	finished  bool
+	finalText string
+	usage     *protocol.ConversationTurnUsage
+	pending   map[string]*elicitationRequest
+	nextReq   int
 }
 
 func newTurn(h *Handler, ctx context.Context, cancel context.CancelFunc,
 	frame protocol.ConversationTurn) *turn {
 	return &turn{h: h, ctx: ctx, cancel: cancel, frame: frame,
-		pending: map[string]*elicitationRequest{}, answerStages: map[string]string{}}
+		pending: map[string]*elicitationRequest{}}
 }
 
 func (t *turn) markAbandoned() {
@@ -167,6 +168,9 @@ func (t *turn) finish(status, errText, sessionID string) {
 
 func (t *turn) run() (status, errText, sessionID string) {
 	frame := t.frame
+	if err := provider.ValidateTaskEnvironment(frame.EnvironmentVariables); err != nil {
+		return "FAILED", "environment variables: " + err.Error(), ""
+	}
 	conversationRoot := filepath.Join(t.h.cfg.WorkspaceRoot, "conversations",
 		strconv.FormatInt(frame.ConversationID, 10))
 	turnRoot := filepath.Join(conversationRoot, "turn-"+strconv.FormatInt(frame.TurnID, 10))
@@ -178,6 +182,9 @@ func (t *turn) run() (status, errText, sessionID string) {
 			return "FAILED", "create conversation workspace: " + err.Error(), ""
 		}
 	}
+	defer func() {
+		_ = workspacegc.TouchConversation(conversationRoot, time.Now())
+	}()
 
 	if frame.CapabilityDownloadURL != "" {
 		if err := capsule.DownloadAndExtract(t.ctx, frame.CapabilityDownloadURL, frame.CapabilitySHA256,
@@ -207,7 +214,7 @@ func (t *turn) run() (status, errText, sessionID string) {
 	}
 
 	content := frame.Content
-	if note := downloadAttachments(t.ctx, frame.Content, workspaceDir, frame.TurnID); note != "" {
+	if note := downloadAttachments(t.ctx, frame.Content, workspaceDir, frame.TurnID, t.h.attachmentPolicy); note != "" {
 		content = note + "\n\n" + content
 	}
 	agentPrompt := prompt.BuildConversation(frame.SystemPrompt, content, packageDir,
@@ -231,6 +238,7 @@ func (t *turn) run() (status, errText, sessionID string) {
 		ReasoningEffort: t.h.cfg.ReasoningEffort,
 		ContextWindow:   t.h.cfg.ContextWindow,
 		SessionID:       frame.CLISessionRef,
+		ConversationID:  frame.ConversationID,
 		MCPConfigPath:   mcpPath,
 		Env:             env,
 		Unattended:      t.h.cfg.Unattended,

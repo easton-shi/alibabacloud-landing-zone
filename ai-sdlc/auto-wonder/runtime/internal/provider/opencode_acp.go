@@ -61,30 +61,47 @@ type acpClient struct {
 	summary   strings.Builder
 	commands  []map[string]any
 	usage     *Usage
+	replaying atomic.Bool
 }
 
-func (o *OpenCode) runACP(ctx context.Context, req Request, emit func(Event)) (Result, error) {
+func (o *OpenCode) runACP(ctx context.Context, req Request, emit func(Event), onStart func(error)) (Result, error) {
+	var startOnce sync.Once
+	start := func(err error) {
+		startOnce.Do(func() { onStart(err) })
+	}
 	command := agentCommand(req.AgentPath, "opencode")
 	cmd := exec.CommandContext(ctx, command, "acp")
 	cmd.Dir = req.WorkDir
-	env := envSlice(currentEnv(), req.Env)
+	env, err := MergeEnvironment(currentEnv(), req.Env)
+	if err != nil {
+		start(err)
+		return Result{}, fmt.Errorf("opencode ACP environment: %w", err)
+	}
 	if content := openCodeConfigContent(req.MCPConfigPath); content != "" {
-		env = envSlice(env, map[string]string{"OPENCODE_CONFIG_CONTENT": content})
+		env, err = MergeEnvironment(env, map[string]string{"OPENCODE_CONFIG_CONTENT": content})
+		if err != nil {
+			start(err)
+			return Result{}, fmt.Errorf("opencode ACP MCP environment: %w", err)
+		}
 	}
 	cmd.Env = env
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
+		start(err)
 		return Result{}, fmt.Errorf("opencode acp stdin: %w", err)
 	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
+		start(err)
 		return Result{}, fmt.Errorf("opencode acp stdout: %w", err)
 	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
+		start(err)
 		return Result{}, fmt.Errorf("opencode acp stderr: %w", err)
 	}
 	if err := cmd.Start(); err != nil {
+		start(err)
 		return Result{}, fmt.Errorf("start opencode acp: %w", err)
 	}
 	client := &acpClient{
@@ -94,29 +111,35 @@ func (o *OpenCode) runACP(ctx context.Context, req Request, emit func(Event)) (R
 	}
 	go client.readLoop()
 	go client.drainStderr()
-	result, runErr := client.run(ctx, req)
+	result, runErr := client.run(ctx, req, start)
 	client.stop()
 	o.mu.Lock()
-	o.commands = client.commandsCopy()
+	if o.commands == nil {
+		o.commands = map[int64][]map[string]any{}
+	}
+	o.commands[req.ConversationID] = client.commandsCopy()
 	o.mu.Unlock()
 	return result, runErr
 }
 
-func (c *acpClient) run(ctx context.Context, req Request) (Result, error) {
+func (c *acpClient) run(ctx context.Context, req Request, onStart func(error)) (Result, error) {
 	if _, err := c.call(ctx, "initialize", map[string]any{
 		"protocolVersion":    1,
 		"clientCapabilities": map[string]any{},
 		"clientInfo":         map[string]any{"name": "autowonder-runtime", "version": "0.1.0"},
 	}); err != nil {
+		onStart(err)
 		return Result{}, fmt.Errorf("opencode ACP initialize: %w", err)
 	}
 	sessionID, err := c.openSession(ctx, req)
 	if err != nil {
+		onStart(err)
 		return Result{}, err
 	}
 	c.mu.Lock()
 	c.sessionID = sessionID
 	c.mu.Unlock()
+	onStart(nil)
 	if req.Model != "" {
 		_, _ = c.call(ctx, "session/set_config_option", map[string]any{
 			"sessionId": sessionID, "configId": "model", "value": req.Model,
@@ -165,9 +188,13 @@ func (c *acpClient) run(ctx context.Context, req Request) (Result, error) {
 
 func (c *acpClient) openSession(ctx context.Context, req Request) (string, error) {
 	if req.SessionID != "" {
+		// ACP replays the persisted conversation while session/load is in
+		// flight. Those updates are history, not output from this turn.
+		c.replaying.Store(true)
 		raw, err := c.call(ctx, "session/load", map[string]any{
 			"sessionId": req.SessionID, "cwd": req.WorkDir, "mcpServers": []any{},
 		})
+		c.replaying.Store(false)
 		if err == nil {
 			var result struct {
 				SessionID string `json:"sessionId"`
@@ -314,6 +341,16 @@ func (c *acpClient) handleNotification(message acpMessage) {
 	if json.Unmarshal(params.Update, &update) != nil {
 		return
 	}
+	if c.replaying.Load() {
+		// Keep command discovery from the loaded session, but do not emit the
+		// replayed message, thought, tool, or plan updates as this turn's output.
+		if update.SessionUpdate == "available_commands_update" {
+			c.mu.Lock()
+			c.commands = update.Available
+			c.mu.Unlock()
+		}
+		return
+	}
 	switch update.SessionUpdate {
 	case "agent_message_chunk":
 		if text := acpText(update.Content); text != "" {
@@ -421,6 +458,7 @@ func (c *acpClient) handlePermission(message acpMessage) {
 		TimeoutSeconds: 1800,
 	})
 	selected := ""
+	answered := err == nil
 	if err == nil {
 		if value, ok := answer.Content["optionId"].(string); ok {
 			for _, id := range ids {
@@ -435,20 +473,26 @@ func (c *acpClient) handlePermission(message acpMessage) {
 		}
 	}
 	if selected == "" {
-		c.respond(message.ID, map[string]any{"outcome": map[string]any{"outcome": "cancelled"}}, nil)
+		writeErr := c.respond(message.ID, map[string]any{"outcome": map[string]any{"outcome": "cancelled"}}, nil)
+		if answered {
+			answer.ReportWritten(writeErr)
+		}
 		return
 	}
-	c.respond(message.ID, map[string]any{"outcome": map[string]any{"outcome": "selected", "optionId": selected}}, nil)
+	writeErr := c.respond(message.ID, map[string]any{"outcome": map[string]any{"outcome": "selected", "optionId": selected}}, nil)
+	if answered {
+		answer.ReportWritten(writeErr)
+	}
 }
 
-func (c *acpClient) respond(id json.RawMessage, result any, rpcErr *acpRPCError) {
+func (c *acpClient) respond(id json.RawMessage, result any, rpcErr *acpRPCError) error {
 	response := map[string]any{"jsonrpc": "2.0", "id": json.RawMessage(id)}
 	if rpcErr != nil {
 		response["error"] = rpcErr
 	} else {
 		response["result"] = result
 	}
-	_ = c.write(response)
+	return c.write(response)
 }
 
 func (c *acpClient) summaryText() string {

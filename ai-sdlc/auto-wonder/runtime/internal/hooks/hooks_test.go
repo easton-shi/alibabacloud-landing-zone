@@ -160,6 +160,31 @@ func TestRunInjectsEnvironmentAndCwd(t *testing.T) {
 	}
 }
 
+func TestWriteGitContextOmitsDispatchEnvironmentValues(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "hook-context.json")
+	if err := WriteGitContext(path, GitContext{
+		DispatchID:  42,
+		StepID:      "7",
+		DispatchEnv: map[string]string{"API_KEY": "super-secret", "CUSTOM": "secret-value"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "super-secret") || strings.Contains(string(raw), "secret-value") {
+		t.Fatalf("persisted hook context contains dispatch environment values: %s", raw)
+	}
+	var persisted map[string]any
+	if err := json.Unmarshal(raw, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := persisted["dispatchEnv"]; ok {
+		t.Fatalf("persisted hook context contains dispatchEnv: %s", raw)
+	}
+}
+
 func TestRunOnceScopes(t *testing.T) {
 	root := writePackage(t, []fixtureHook{{name: "once", trigger: BeforeStep, interp: "sh",
 		command: "scripts/check.sh", script: "printf 'run\\n' >> \"$AUTOWONDER_STATE_DIR/count.txt\"\n",

@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -159,5 +160,62 @@ func TestCompareVersions(t *testing.T) {
 		if got := CompareVersions(test.a, test.b); got != test.want {
 			t.Errorf("CompareVersions(%q,%q) = %d, want %d", test.a, test.b, got, test.want)
 		}
+	}
+}
+
+func TestVerifyCandidateRequiresExpectedVersion(t *testing.T) {
+	dir := t.TempDir()
+	candidate := filepath.Join(dir, "candidate")
+	if err := os.WriteFile(candidate, []byte("#!/bin/sh\necho 'autowonder-runtime 0.2.0'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	updater := &Updater{}
+	if err := updater.VerifyCandidate(candidate, "0.2.0"); err != nil {
+		t.Fatal(err)
+	}
+	if err := updater.VerifyCandidate(candidate, "0.3.0"); err == nil {
+		t.Fatal("version mismatch was accepted")
+	}
+}
+
+func TestRecoverPendingRollsBackVersionMismatch(t *testing.T) {
+	dir := t.TempDir()
+	executable := filepath.Join(dir, "autowonder-runtime")
+	if err := os.WriteFile(executable, []byte("new"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(executable+".bak", []byte("old"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	updater := New(Config{BaseURL: "https://example.com"}, "0.1.0", executable,
+		filepath.Join(dir, "receipt.json"))
+	if err := updater.WriteReceipt(Receipt{
+		RequestID: "r1", ReceiptID: "c1", TargetVersion: "0.2.0", Phase: "restarting",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	rolledBack, err := updater.RecoverPending()
+	if err != nil || !rolledBack {
+		t.Fatalf("rolledBack=%t err=%v", rolledBack, err)
+	}
+	installed, err := os.ReadFile(executable)
+	if err != nil || string(installed) != "old" {
+		t.Fatalf("installed=%q err=%v", installed, err)
+	}
+	receipt, err := updater.ReadReceipt()
+	if err != nil || receipt == nil || receipt.Phase != "rolled_back" {
+		t.Fatalf("receipt=%#v err=%v", receipt, err)
+	}
+}
+
+func TestSupportsSelfUpdateRequiresAuthenticatedReleaseSource(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("in-place update is intentionally unsupported on Windows")
+	}
+	if (&Updater{Config: Config{BaseURL: "https://updates.example"}}).SupportsSelfUpdate() {
+		t.Fatal("unsigned update source was advertised")
+	}
+	if !(&Updater{Config: Config{BaseURL: "https://updates.example", PublicKey: "key"}}).SupportsSelfUpdate() {
+		t.Fatal("signed update source was not advertised")
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -51,13 +52,102 @@ for line in sys.stdin:
         send({"jsonrpc":"2.0","id":ident,"result":{"stopReason":"end_turn","usage":{"inputTokens":10,"outputTokens":2,"thoughtTokens":1,"cachedReadTokens":3}}})
 `
 
-func fakeACPExecutable(t *testing.T) string {
+const fakeACPFirstTurn = `#!/usr/bin/env python3
+import json, sys
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+session = "ses_replay"
+
+for line in sys.stdin:
+    msg = json.loads(line)
+    method = msg.get("method")
+    ident = msg.get("id")
+    if method == "initialize":
+        send({"jsonrpc":"2.0","id":ident,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":True}}})
+    elif method == "session/new":
+        send({"jsonrpc":"2.0","id":ident,"result":{"sessionId":session,"configOptions":[]}})
+    elif method == "session/prompt":
+        send({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":session,"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"first answer"}}}})
+        send({"jsonrpc":"2.0","id":ident,"result":{"stopReason":"end_turn"}})
+`
+
+const fakeACPReplaySecondTurn = `#!/usr/bin/env python3
+import json, sys
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+session = "ses_replay"
+
+for line in sys.stdin:
+    msg = json.loads(line)
+    method = msg.get("method")
+    ident = msg.get("id")
+    if method == "initialize":
+        send({"jsonrpc":"2.0","id":ident,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":True}}})
+    elif method == "session/load":
+        send({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":session,"update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"first question"}}}})
+        send({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":session,"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"first answer"}}}})
+        send({"jsonrpc":"2.0","id":ident,"result":{"sessionId":session,"configOptions":[]}})
+    elif method == "session/prompt":
+        send({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":session,"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"second answer"}}}})
+        send({"jsonrpc":"2.0","id":ident,"result":{"stopReason":"end_turn"}})
+`
+
+func fakeACPExecutableWithScript(t *testing.T, script string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "opencode")
-	if err := os.WriteFile(path, []byte(fakeACP), 0o755); err != nil {
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	return path
+}
+
+func fakeACPExecutable(t *testing.T) string {
+	return fakeACPExecutableWithScript(t, fakeACP)
+}
+
+func TestOpenCodeACPTwoTurnLoadDoesNotRepeatFirstTurn(t *testing.T) {
+	first := &OpenCode{}
+	firstResult, err := first.Run(context.Background(), Request{
+		AgentPath: fakeACPExecutableWithScript(t, fakeACPFirstTurn),
+		WorkDir:   t.TempDir(),
+		Prompt:    "first question",
+		UseACP:    true,
+	}, func(Event) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstResult.FullText != "first answer" {
+		t.Fatalf("first turn full text = %q", firstResult.FullText)
+	}
+
+	second := &OpenCode{}
+	var secondEvents []Event
+	secondResult, err := second.Run(context.Background(), Request{
+		AgentPath: fakeACPExecutableWithScript(t, fakeACPReplaySecondTurn),
+		WorkDir:   t.TempDir(),
+		Prompt:    "second question",
+		UseACP:    true,
+		SessionID: firstResult.SessionID,
+	}, func(event Event) {
+		secondEvents = append(secondEvents, event)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if secondResult.FullText != "second answer" {
+		t.Fatalf("second turn full text = %q, want only current turn", secondResult.FullText)
+	}
+	for _, event := range secondEvents {
+		if event.Kind == "text" && event.FullText != "second answer" {
+			t.Fatalf("second turn emitted replayed text %q", event.FullText)
+		}
+	}
 }
 
 func TestOpenCodeACPStreamsToolsPlansAndUsage(t *testing.T) {
@@ -65,7 +155,7 @@ func TestOpenCodeACPStreamsToolsPlansAndUsage(t *testing.T) {
 	var events []Event
 	result, err := provider.Run(context.Background(), Request{
 		AgentPath: fakeACPExecutable(t), WorkDir: t.TempDir(), Prompt: "run echo",
-		UseACP: true, Model: "opencode/big-pickle",
+		UseACP: true, Model: "opencode/big-pickle", ConversationID: 100,
 	}, func(event Event) { events = append(events, event) })
 	if err != nil {
 		t.Fatal(err)
@@ -95,22 +185,34 @@ func TestOpenCodeACPStreamsToolsPlansAndUsage(t *testing.T) {
 		t.Fatalf("missing events: text=%t thinking=%t toolStart=%t toolResult=%t plan=%t events=%#v",
 			text, thinking, toolStart, toolResult, plan, events)
 	}
-	if commands := provider.Commands(); len(commands) != 1 || commands[0]["name"] != "review" {
+	if commands := provider.CommandsFor(100); len(commands) != 1 || commands[0]["name"] != "review" {
 		t.Fatalf("commands = %#v", commands)
+	}
+	if commands := provider.CommandsFor(101); len(commands) != 0 {
+		t.Fatalf("commands leaked to another conversation: %#v", commands)
 	}
 }
 
 func TestOpenCodeACPPermissionRoundTrip(t *testing.T) {
 	provider := &OpenCode{}
 	var text string
+	var written atomic.Bool
 	_, err := provider.Run(context.Background(), Request{
 		AgentPath: fakeACPExecutable(t), WorkDir: t.TempDir(), Prompt: "needs permission",
-		UseACP: true,
+		UseACP: true, Interactive: true,
 		RequestInput: func(_ context.Context, input InputRequest) (InputAnswer, error) {
 			if input.Kind != "APPROVAL" || !strings.Contains(input.Message, "Run shell") {
 				t.Fatalf("unexpected permission request: %#v", input)
 			}
-			return InputAnswer{Action: "accept", Content: map[string]any{"optionId": "once"}}, nil
+			return InputAnswer{
+				Action: "accept", Content: map[string]any{"optionId": "once"},
+				Written: func(err error) {
+					if err != nil {
+						t.Fatalf("unexpected write error: %v", err)
+					}
+					written.Store(true)
+				},
+			}, nil
 		},
 	}, func(event Event) {
 		if event.Kind == "text" {
@@ -122,5 +224,8 @@ func TestOpenCodeACPPermissionRoundTrip(t *testing.T) {
 	}
 	if text != "chosen:once" {
 		t.Fatalf("text = %q", text)
+	}
+	if !written.Load() {
+		t.Fatal("permission answer was not acknowledged as written")
 	}
 }

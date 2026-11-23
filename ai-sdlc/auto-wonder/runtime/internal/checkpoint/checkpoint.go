@@ -23,7 +23,10 @@ import (
 	"github.com/aliyun/alibabacloud-landing-zone/ai-sdlc/auto-wonder/runtime/internal/repos"
 )
 
-const SchemaVersion = "autowonder.runtimeCheckpoint.v1"
+const (
+	SchemaVersion            = "autowonder.runtimeCheckpoint.v1"
+	LightweightSchemaVersion = "autowonder.runtimeCheckpoint.lightweight.v1"
+)
 
 // RepoState is the recoverable commit of one repository.
 type RepoState struct {
@@ -36,7 +39,10 @@ type RepoState struct {
 // Document is the root checkpoint.json.
 type Document struct {
 	SchemaVersion string      `json:"schemaVersion"`
-	Repos         []RepoState `json:"repos"`
+	DispatchID    string      `json:"dispatchId,omitempty"`
+	CheckpointSeq int64       `json:"checkpointSeq,omitempty"`
+	StateSha256   string      `json:"stateSha256,omitempty"`
+	Repos         []RepoState `json:"repos,omitempty"`
 }
 
 // Receipt is the server response after a checkpoint upload.
@@ -48,7 +54,9 @@ type Receipt struct {
 
 // Archive builds the gzip/tar checkpoint and returns its SHA-256.
 func Archive(document Document) ([]byte, string, error) {
-	document.SchemaVersion = SchemaVersion
+	if document.SchemaVersion == "" {
+		document.SchemaVersion = SchemaVersion
+	}
 	raw, err := json.Marshal(document)
 	if err != nil {
 		return nil, "", fmt.Errorf("encode checkpoint: %w", err)
@@ -71,6 +79,14 @@ func Archive(document Document) ([]byte, string, error) {
 	}
 	digest := sha256.Sum256(buffer.Bytes())
 	return buffer.Bytes(), "sha256:" + hex.EncodeToString(digest[:]), nil
+}
+
+// BuildLightweight builds the lightweight v1 checkpoint envelope. It retains
+// the same tar/gzip container and checkpoint.json entry as historical v1 so
+// readers can distinguish the format by schemaVersion before interpreting it.
+func BuildLightweight(document Document) ([]byte, string, error) {
+	document.SchemaVersion = LightweightSchemaVersion
+	return Archive(document)
 }
 
 // FromCheckouts captures the current committed state of every checkout.

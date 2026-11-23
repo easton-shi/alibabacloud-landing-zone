@@ -38,6 +38,9 @@ func WriteGitContext(path string, gitContext GitContext) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
+	// Git hooks inherit the provider environment; persisting task values here
+	// would leave platform secrets on disk after the dispatch.
+	gitContext.DispatchEnv = nil
 	raw, err := json.MarshalIndent(gitContext, "", "  ")
 	if err != nil {
 		return err

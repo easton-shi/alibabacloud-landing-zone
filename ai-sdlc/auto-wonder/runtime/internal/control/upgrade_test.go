@@ -78,7 +78,7 @@ func releaseServer(t *testing.T, version string, artifact []byte) *httptest.Serv
 }
 
 func TestUpgradeDownloadsReplacesAndExecs(t *testing.T) {
-	artifact := []byte("new-binary")
+	artifact := []byte("#!/bin/sh\n[ \"$1\" = \"--version\" ] && echo 'autowonder-runtime 0.2.0'\n")
 	server := releaseServer(t, "0.2.0", artifact)
 	dir := t.TempDir()
 	executable := filepath.Join(dir, "autowonder-runtime")
@@ -142,6 +142,51 @@ func TestUpgradeDownloadsReplacesAndExecs(t *testing.T) {
 	}
 }
 
+func TestUpgradeRejectsCandidateVersionMismatchBeforeReplace(t *testing.T) {
+	artifact := []byte("#!/bin/sh\n[ \"$1\" = \"--version\" ] && echo 'autowonder-runtime 9.9.9'\n")
+	server := releaseServer(t, "0.2.0", artifact)
+	dir := t.TempDir()
+	executable := filepath.Join(dir, "autowonder-runtime")
+	if err := os.WriteFile(executable, []byte("old-binary"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	updater := update.New(update.Config{BaseURL: server.URL, Insecure: true}, "0.1.0", executable,
+		filepath.Join(dir, "state", "receipt.json"))
+	recorder := &upgradeRecorder{}
+	called := false
+	handler := &Handler{
+		ExecutorID: 5, Version: "0.1.0", Executable: executable,
+		Inventory: &fakeInventory{}, Send: recorder.send, Updater: updater,
+		Exec: func(string, []string, []string) error { called = true; return nil },
+	}
+	raw, _ := json.Marshal(UpgradeFrame{
+		Type: "EXECUTOR_UPGRADE", ExecutorID: 5, RequestID: "upgrade-bad", TargetVersion: "0.2.0",
+	})
+	handler.Handle(context.Background(), raw)
+	result := recorder.waitFor(t, "failed")
+	if !strings.Contains(result.Error, "version mismatch") {
+		t.Fatalf("failure = %#v", result)
+	}
+	installed, err := os.ReadFile(executable)
+	if err != nil || string(installed) != "old-binary" || called {
+		t.Fatalf("executable=%q called=%t err=%v", installed, called, err)
+	}
+}
+
+func TestUpgradeRejectsExpiredRequest(t *testing.T) {
+	recorder := &upgradeRecorder{}
+	handler := &Handler{ExecutorID: 5, Version: "0.1.0", Send: recorder.send, Inventory: &fakeInventory{}}
+	raw, _ := json.Marshal(UpgradeFrame{
+		Type: "EXECUTOR_UPGRADE", ExecutorID: 5, RequestID: "expired", TargetVersion: "0.2.0",
+		IssuedAt: time.Now().Add(-2 * time.Minute).UTC().Format(time.RFC3339),
+	})
+	handler.Handle(context.Background(), raw)
+	result := recorder.waitFor(t, "failed")
+	if !strings.Contains(result.Error, "expired") {
+		t.Fatalf("failure = %#v", result)
+	}
+}
+
 func TestUpgradeWithoutSourceReportsRetryableFailure(t *testing.T) {
 	recorder := &upgradeRecorder{}
 	handler := &Handler{ExecutorID: 5, Version: "0.1.0", Send: recorder.send, Inventory: &fakeInventory{}}
@@ -177,6 +222,28 @@ func TestPublishUpgradeReceiptAndAcknowledge(t *testing.T) {
 	handler.acknowledgeUpgrade(ack)
 	if receipt, err := updater.ReadReceipt(); err != nil || receipt != nil {
 		t.Fatalf("receipt not cleared: %#v err=%v", receipt, err)
+	}
+}
+
+func TestPublishRolledBackReceiptReportsFailure(t *testing.T) {
+	dir := t.TempDir()
+	updater := update.New(update.Config{BaseURL: "https://example.com", Insecure: true}, "0.1.0",
+		filepath.Join(dir, "runtime"), filepath.Join(dir, "receipt.json"))
+	if err := updater.WriteReceipt(update.Receipt{
+		RequestID: "upgrade-rollback", ReceiptID: "receipt-rollback", TargetVersion: "0.2.0",
+		Phase: "rolled_back", Error: "started version 0.1.0, expected 0.2.0",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	recorder := &upgradeRecorder{}
+	handler := &Handler{ExecutorID: 5, Version: "0.1.0", Updater: updater}
+	handler.PublishUpgradeReceipt(recorder.send)
+	result := recorder.waitFor(t, "failed")
+	if !result.Terminal || !strings.Contains(result.Error, "expected 0.2.0") {
+		t.Fatalf("rollback result = %#v", result)
+	}
+	if receipt, err := updater.ReadReceipt(); err != nil || receipt == nil {
+		t.Fatalf("rollback receipt should await ACK: %#v err=%v", receipt, err)
 	}
 }
 
